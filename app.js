@@ -198,6 +198,26 @@ function conflictWorker(empId, dateStr, start, end) {
   }
   return null;
 }
+// 某班別時段是否已被「排定」（approved 班表）；回傳排班者或 null
+function covererOf(dateStr, start, end) {
+  const s0 = toMin(start), e0 = toMin(end);
+  for (const s of state.shifts) {
+    if (s.work_date !== dateStr || s.status !== "work" || !s.start_time || !s.end_time) continue;
+    const a = toMin(s.start_time), b = toMin(s.end_time);
+    if (s0 < b && a < e0) return state.employees.find((e) => e.id === s.employee_id) || { name: "?" };
+  }
+  return null;
+}
+// 某班別時段是否已有「待核准的上班申請」（給其他 PT 看到已被搶）；回傳申請者或 null
+function requesterOf(dateStr, start, end) {
+  const s0 = toMin(start), e0 = toMin(end);
+  for (const r of state.requests) {
+    if (r.work_date !== dateStr || r.req_type !== "work" || r.state !== "pending" || !r.start_time || !r.end_time) continue;
+    const a = toMin(r.start_time), b = toMin(r.end_time);
+    if (s0 < b && a < e0) return { emp: state.employees.find((e) => e.id === r.employee_id), r };
+  }
+  return null;
+}
 
 function bhFor(dateStr) {
   const dow = new Date(dateStr + "T00:00:00").getDay();
@@ -584,6 +604,36 @@ function renderDayPanel(dateStr) {
     panel.appendChild(gapBox);
   }
 
+  // PT 選班別：正職排完後，PT 直接點還空著的班別送出申請
+  if (!isAdmin && !closed && _bh && _bh.is_open && state.presets.length) {
+    const myShift = shiftOf(state.user.id, dateStr);
+    const box = document.createElement("div"); box.className = "dp-shifts";
+    box.appendChild(frag(`<div class="dp-shifts-h">可選班別</div>`));
+    state.presets.forEach((p) => {
+      const info = `${esc(p.label)}　${p.start_time}-${p.end_time}`;
+      const coverer = covererOf(dateStr, p.start_time, p.end_time);
+      const requester = coverer ? null : requesterOf(dateStr, p.start_time, p.end_time);
+      const row = document.createElement("div"); row.className = "shift-pick";
+      if (coverer) {
+        row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-taken">已排：${esc(coverer.name)}</span>`;
+      } else if (requester) {
+        const who = requester.emp ? requester.emp.name : "他人";
+        const mine = requester.r.employee_id === state.user.id;
+        row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-pending">${mine ? "你已申請，待核准" : "已被申請：" + esc(who)}</span>`;
+      } else if (myShift) {
+        row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-open">空缺</span>`;
+      } else {
+        row.innerHTML = `<span class="sp-info">${info}</span>`;
+        const btn = frag(`<button class="btn btn-primary btn-sm">選這班</button>`);
+        btn.onclick = () => pickShift(p, dateStr);
+        row.appendChild(btn);
+      }
+      box.appendChild(row);
+    });
+    if (myShift) box.appendChild(frag(`<div class="dp-shifts-note">你當天已排：${shiftText(myShift)}（要換班請按下方自己那列的「改申請」）</div>`));
+    panel.appendChild(box);
+  }
+
   // 剪貼簿提示
   if (state.clipboard) {
     const c = state.clipboard;
@@ -698,6 +748,26 @@ async function pasteShift(empId, dateStr) {
     });
   }
   await loadAndRender();
+}
+
+// PT 點選空班別 → 送出上班申請（待管理者核准）
+async function pickShift(p, dateStr) {
+  const err = validateWorkTime(dateStr, p.start_time, p.end_time);
+  if (err) { alert("⚠️ " + err); return; }
+  // 送出前再確認一次沒被排走 / 沒被別人搶先申請
+  const cf = covererOf(dateStr, p.start_time, p.end_time);
+  if (cf) { alert(`這個班別已經被 ${cf.name} 排走了。`); await loadAndRender(); return; }
+  const rq = requesterOf(dateStr, p.start_time, p.end_time);
+  if (rq && rq.r.employee_id !== state.user.id) { alert(`這個班別已經有${rq.emp ? rq.emp.name : "人"}申請了，你可以選別班。`); await loadAndRender(); return; }
+  const [, mm, dd] = dateStr.split("-").map(Number);
+  if (!confirm(`送出「${p.label} ${p.start_time}-${p.end_time}」的上班申請（${mm}月${dd}日）？`)) return;
+  const { error } = await sb.from("requests").insert({
+    employee_id: state.user.id, work_date: dateStr, req_type: "work",
+    start_time: p.start_time, end_time: p.end_time,
+  });
+  if (error) { alert("送出失敗：" + error.message); return; }
+  await loadAndRender();
+  alert("已送出申請，待管理者核准 🎀");
 }
 
 // 編輯當日特殊事項（管理者）
@@ -1390,6 +1460,44 @@ async function openAdmin() {
     ltList.appendChild(ltCard(null));
     body.appendChild(ltList);
   }
+
+  // ---- 班別設定（早班/晚班…，PT 依此選班）----
+  body.appendChild(frag(`<div class="divider"></div>`));
+  body.appendChild(frag(`<p class="subhead">班別設定（例：早班 9:30–14:00、晚班 13:00–22:00）。正職排完後，PT 會依這裡的班別點選空缺。</p>`));
+  const psList = document.createElement("div"); psList.className = "adm-list";
+  const psOpts = timeOptions();
+  function psCard(p) {
+    const card = document.createElement("div"); card.className = "adm-card";
+    const fields = document.createElement("div"); fields.className = "adm-fields";
+    const label = frag(`<input class="inp" placeholder="班別名稱，例：早班">`); label.value = p?.label || "";
+    const ss = document.createElement("select"); ss.className = "inp"; ss.innerHTML = psOpts.map((t) => `<option>${t}</option>`).join(""); ss.value = p?.start_time || "09:30";
+    const es = document.createElement("select"); es.className = "inp"; es.innerHTML = psOpts.map((t) => `<option>${t}</option>`).join(""); es.value = p?.end_time || "14:00";
+    fields.append(fieldWrap("名稱", label, "fld-grow"), fieldWrap("開始", ss, "fld-cat"), fieldWrap("結束", es, "fld-cat"));
+    card.appendChild(fields);
+    const foot = document.createElement("div"); foot.className = "adm-foot";
+    const act = frag(`<button class="btn btn-sm btn-outline">${p ? "更新" : "＋ 新增班別"}</button>`);
+    act.onclick = async () => {
+      if (!label.value.trim()) { alert("請填班別名稱"); return; }
+      if (toMin(es.value) <= toMin(ss.value)) { alert("結束時間需晚於開始時間"); return; }
+      const payload = { label: label.value.trim(), start_time: ss.value, end_time: es.value };
+      let res;
+      if (p) res = await sb.from("preset_shifts").update(payload).eq("id", p.id);
+      else res = await sb.from("preset_shifts").insert({ ...payload, sort_order: (state.presets.reduce((m, x) => Math.max(m, x.sort_order || 0), 0)) + 1 });
+      if (res.error) { alert("儲存失敗：" + res.error.message); return; }
+      m.close(); await loadStatic(); loadAndRender(); openAdmin();
+    };
+    foot.appendChild(act);
+    if (p) {
+      const del = frag(`<button class="p-del" title="刪除">🗑</button>`);
+      del.onclick = async () => { if (!confirm(`刪除班別「${p.label}」？`)) return; await sb.from("preset_shifts").delete().eq("id", p.id); m.close(); await loadStatic(); loadAndRender(); openAdmin(); };
+      foot.appendChild(del);
+    }
+    card.appendChild(foot);
+    return card;
+  }
+  (state.presets || []).forEach((p) => psList.appendChild(psCard(p)));
+  psList.appendChild(psCard(null));
+  body.appendChild(psList);
 
   body.appendChild(frag(`<div class="divider"></div>`));
   body.appendChild(frag(`<p class="subhead">營業時間（公休日不可排班、月曆自動標公休）</p>`));

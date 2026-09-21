@@ -236,6 +236,15 @@ body {
 .day-panel .dp-gaps { font-size: 13px; color: var(--text-dim); margin-bottom: 8px; line-height: 1.9; }
 .day-panel .dp-gaps b { color: var(--st-work); background: rgba(111,176,106,.14); border-radius: 6px; padding: 1px 7px; margin: 0 2px; white-space: nowrap; }
 .day-panel .dp-gaps-full { color: var(--st-work); font-weight: 600; }
+.day-panel .dp-shifts { margin: 4px 0 12px; border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px; background: rgba(0,0,0,0.12); }
+.day-panel .dp-shifts-h { font-size: 13px; color: var(--amber); font-weight: 700; margin-bottom: 8px; }
+.day-panel .shift-pick { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--line); }
+.day-panel .shift-pick:last-child { border-bottom: none; }
+.day-panel .shift-pick .sp-info { flex: 1; font-weight: 600; }
+.day-panel .shift-pick .sp-taken { font-size: 12px; color: var(--text-mute); }
+.day-panel .shift-pick .sp-pending { font-size: 12px; color: var(--amber); font-weight: 600; }
+.day-panel .shift-pick .sp-open { font-size: 12px; color: var(--st-work); }
+.day-panel .dp-shifts-note { margin-top: 8px; font-size: 12px; color: var(--text-mute); }
 
 /* ⚡ 快速排班 */
 #quick-bar { background: var(--amber-soft); border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; }
