@@ -101,11 +101,18 @@ function workersOf(dateStr) {
     .sort((a, b) => toMin(a.s.start_time) - toMin(b.s.start_time));
 }
 
-// 營業時間是否「沒排滿」（回傳未覆蓋的分鐘數；0 = 有排滿）
-function uncoveredMinutes(dateStr) {
+// 排班時間（需要有人涵蓋的時段）：優先用 business_hours.staff_open/staff_close，沒設就用營業時間
+function coverWindow(dateStr) {
   const bh = bhFor(dateStr);
-  if (!bh || !bh.is_open) return 0;
-  const open = toMin(bh.open_time), close = toMin(bh.close_time);
+  if (!bh || !bh.is_open) return null;
+  return { open: bh.staff_open || bh.open_time, close: bh.staff_close || bh.close_time };
+}
+
+// 排班時間是否「沒排滿」（回傳未覆蓋的分鐘數；0 = 有排滿）
+function uncoveredMinutes(dateStr) {
+  const cw = coverWindow(dateStr);
+  if (!cw) return 0;
+  const open = toMin(cw.open), close = toMin(cw.close);
   const ivs = state.shifts
     .filter((s) => s.work_date === dateStr && s.status === "work" && s.start_time && s.end_time)
     .map((s) => [Math.max(toMin(s.start_time), open), Math.min(toMin(s.end_time), close)])
@@ -120,11 +127,11 @@ function uncoveredMinutes(dateStr) {
   return uncovered;
 }
 
-// 當天營業時間內「還沒人排」的空檔（回傳 [[起,迄]...] 分鐘）——單人顧店：正職排完後剩給 PT 選
+// 當天排班時間內「還沒人排」的空檔（回傳 [[起,迄]...] 分鐘）
 function openGaps(dateStr) {
-  const bh = bhFor(dateStr);
-  if (!bh || !bh.is_open) return [];
-  const open = toMin(bh.open_time), close = toMin(bh.close_time);
+  const cw = coverWindow(dateStr);
+  if (!cw) return [];
+  const open = toMin(cw.open), close = toMin(cw.close);
   const ivs = state.shifts
     .filter((s) => s.work_date === dateStr && s.status === "work" && s.start_time && s.end_time)
     .map((s) => [Math.max(toMin(s.start_time), open), Math.min(toMin(s.end_time), close)])
@@ -373,21 +380,24 @@ function renderCalendar() {
     let sub = "", numStyle = "";
     if (closed) {
       sub = `<div class="closed-tag">公休</div>`;
-    } else if (state.viewEmp === "__all__") {
+    } else if (state.viewEmp === "__all__" || !state.user.is_admin) {
+      // 整店 / PT：格子上直接列出當天誰上班＋時段
       const workers = workersOf(date);
       if (workers.length) {
         sub = `<div class="wlist">` + workers.map((w) =>
           `<div class="wline"><span class="wn">${w.emp.name}</span> ${compactTime(w.s.start_time)}-${compactTime(w.s.end_time)}</div>`).join("") + `</div>`;
       }
-      const gap = uncoveredMinutes(date);
-      if (gap > 0) { cls.push("gap"); sub += `<div class="gap-tag">⚠ 未排滿</div>`; }
+      if (state.user.is_admin) {
+        const gap = uncoveredMinutes(date);
+        if (gap > 0) { cls.push("gap"); sub += `<div class="gap-tag">⚠ 未排滿</div>`; }
+      } else {
+        const open = openShiftsFor(date);   // PT：還可搶的班別
+        if (open.length) { cls.push("has-open"); sub += open.map((p) => `<div class="open-tag">＋${esc(p.label)}</div>`).join(""); }
+      }
     } else {
+      // 管理者用「檢視」看單一員工
       const s = shiftOf(state.viewEmp, date);
       if (s) { const meta = statusMeta(s.status); numStyle = `background:${meta.color};color:${textOn(meta.color)}`; sub = `<div class="sub">${shiftText(s)}</div>`; }
-      else if (!state.user.is_admin) {   // PT：沒排到自己的班、又有空班別可搶 → 外層直接標「可排」
-        const open = openShiftsFor(date);
-        if (open.length) { cls.push("has-open"); sub = open.map((p) => `<div class="open-tag">＋${esc(p.label)}</div>`).join(""); }
-      }
     }
     if (date === state.selectedDate) cls.push("selected");
     const dot = reqDates.has(date) ? `<span class="req-dot"></span>` : "";
@@ -1115,8 +1125,19 @@ function signaturePad(container) {
 async function openAdmin() {
   const { data: allEmp } = await sb.from("employees").select("*").order("category").order("sort_order");
   const body = document.createElement("div");
+  const tabbar = document.createElement("div"); tabbar.className = "adm-tabs"; body.appendChild(tabbar);
+  const empPane = document.createElement("div"); const hoursPane = document.createElement("div"); const shiftPane = document.createElement("div");
+  [["員工管理", empPane], ["營業時間", hoursPane], ["班別設定", shiftPane]].forEach(([lbl, pane], i) => {
+    pane.className = "adm-panel"; pane.style.display = i === 0 ? "" : "none"; body.appendChild(pane);
+    const tb = frag(`<button class="adm-tab${i === 0 ? " on" : ""}">${lbl}</button>`);
+    tb.onclick = () => {
+      tabbar.querySelectorAll(".adm-tab").forEach((b) => b.classList.remove("on")); tb.classList.add("on");
+      [empPane, hoursPane, shiftPane].forEach((p) => (p.style.display = "none")); pane.style.display = "";
+    };
+    tabbar.appendChild(tb);
+  });
 
-  body.appendChild(frag(`<p class="subhead">員工管理（時薪僅 PT／教練用；正職為月薪不填時薪）</p>`));
+  empPane.appendChild(frag(`<p class="subhead">員工管理（時薪僅 PT／教練用；正職為月薪不填時薪）</p>`));
   const empList = document.createElement("div"); empList.className = "adm-list";
 
   function empCard(e) {
@@ -1165,11 +1186,10 @@ async function openAdmin() {
   }
   (allEmp || []).forEach((e) => empList.appendChild(empCard(e)));
   empList.appendChild(empCard(null));
-  body.appendChild(empList);
+  empPane.appendChild(empList);
 
   // ---- 班別設定（早班/晚班…，PT 依此選班）----
-  body.appendChild(frag(`<div class="divider"></div>`));
-  body.appendChild(frag(`<p class="subhead">班別設定（例：早班 9:30–14:00、晚班 13:00–22:00）。「計薪時數」＝算 PT 薪水用的小時數（例：早班 4、晚班 8）。正職排完後 PT 依此點選空缺。</p>`));
+  shiftPane.appendChild(frag(`<p class="subhead">班別設定（例：早班 9:30–14:00、晚班 13:00–22:00）。「計薪時數」＝算 PT 薪水用的小時數（例：早班 4、晚班 8）。正職排完後 PT 依此點選空缺。</p>`));
   const psList = document.createElement("div"); psList.className = "adm-list";
   const psOpts = timeOptions();
   function psCard(p) {
@@ -1205,10 +1225,9 @@ async function openAdmin() {
   }
   (state.presets || []).forEach((p) => psList.appendChild(psCard(p)));
   psList.appendChild(psCard(null));
-  body.appendChild(psList);
+  shiftPane.appendChild(psList);
 
-  body.appendChild(frag(`<div class="divider"></div>`));
-  body.appendChild(frag(`<p class="subhead">營業時間（公休日不可排班、月曆自動標公休）</p>`));
+  hoursPane.appendChild(frag(`<p class="subhead">營業時間＝店幾點開到幾點（公休日月曆自動標公休）。排班時間＝需要有人顧的時段，月曆「未排滿」以它為準（留空＝同營業時間）。</p>`));
   const opts = timeOptions();
   const bhList = document.createElement("div"); bhList.className = "adm-list";
   const ctrls = [];
@@ -1220,19 +1239,31 @@ async function openAdmin() {
     const openL = document.createElement("label"); openL.className = "fld fld-check"; openL.append(open, frag(`<span>營業</span>`));
     const o = document.createElement("select"); o.className = "inp"; o.innerHTML = opts.map((t) => `<option>${t}</option>`).join(""); o.value = bh.open_time;
     const c = document.createElement("select"); c.className = "inp"; c.innerHTML = opts.map((t) => `<option>${t}</option>`).join(""); c.value = bh.close_time;
-    fields.append(frag(`<div class="fld fld-cat"><span>星期</span><div class="adm-name-lg" style="padding-top:2px">週${DOW[i]}</div></div>`), openL, fieldWrap("開始", o, "fld-cat"), fieldWrap("結束", c, "fld-cat"));
+    const blank = `<option value="">—</option>`;
+    const so = document.createElement("select"); so.className = "inp"; so.innerHTML = blank + opts.map((t) => `<option>${t}</option>`).join(""); so.value = bh.staff_open || "";
+    const sc = document.createElement("select"); sc.className = "inp"; sc.innerHTML = blank + opts.map((t) => `<option>${t}</option>`).join(""); sc.value = bh.staff_close || "";
+    fields.append(
+      frag(`<div class="fld fld-cat"><span>星期</span><div class="adm-name-lg" style="padding-top:2px">週${DOW[i]}</div></div>`), openL,
+      fieldWrap("營業開始", o, "fld-cat"), fieldWrap("營業結束", c, "fld-cat"),
+      fieldWrap("排班開始", so, "fld-cat"), fieldWrap("排班結束", sc, "fld-cat"));
     card.appendChild(fields); bhList.appendChild(card);
-    ctrls.push({ weekday: i, open, o, c });
+    ctrls.push({ weekday: i, open, o, c, so, sc });
   }
-  body.appendChild(bhList);
-
-  const foot = document.createElement("button"); foot.className = "btn btn-primary"; foot.textContent = "儲存營業時間";
-  foot.onclick = async () => {
-    const rows = ctrls.map((x) => ({ weekday: x.weekday, is_open: x.open.checked, open_time: x.o.value, close_time: x.c.value }));
-    await sb.from("business_hours").upsert(rows, { onConflict: "weekday" });
+  hoursPane.appendChild(bhList);
+  const saveBh = frag(`<button class="btn btn-primary" style="margin-top:12px">儲存營業時間</button>`);
+  saveBh.onclick = async () => {
+    const rows = ctrls.map((x) => ({ weekday: x.weekday, is_open: x.open.checked, open_time: x.o.value, close_time: x.c.value, staff_open: x.so.value || null, staff_close: x.sc.value || null }));
+    let res = await sb.from("business_hours").upsert(rows, { onConflict: "weekday" });
+    if (res.error && /staff_|column|schema/i.test(res.error.message)) {
+      const bare = rows.map(({ staff_open, staff_close, ...r }) => r);
+      res = await sb.from("business_hours").upsert(bare, { onConflict: "weekday" });
+    }
+    if (res.error) { alert("儲存失敗：" + res.error.message); return; }
     await loadStatic(); loadAndRender(); alert("營業時間已儲存");
   };
-  const m = openModal("管理設定", body, foot, true);
+  hoursPane.appendChild(saveBh);
+
+  const m = openModal("管理設定", body, null, true);
 }
 
 // ============================================================

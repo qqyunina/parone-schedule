@@ -326,6 +326,11 @@ table.simple input, table.simple select { width: 100%; }
 .inp { background: var(--bg-2); color: var(--text); font: inherit; border: 1px solid var(--line-2); border-radius: 6px; padding: 7px 9px; }
 .inp:focus { outline: none; border-color: var(--amber); }
 
+/* 管理後台：分頁籤 */
+.adm-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+.adm-tab { font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; padding: 8px 16px; border-radius: 20px; border: 1px solid var(--line-2); background: var(--bg-2); color: var(--text-dim); }
+.adm-tab.on { background: var(--amber); border-color: var(--amber); color: #16110d; }
+
 /* 管理後台：卡片式表單（取代擁擠表格，手機友善） */
 .adm-list { display: flex; flex-direction: column; gap: 10px; }
 .adm-card { background: rgba(0,0,0,0.14); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
