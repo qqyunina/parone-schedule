@@ -208,6 +208,9 @@ body {
 .cal-cell.gap { border-color: var(--st-fixed); }
 .cal-cell.has-note { border-color: rgba(217,164,74,0.5); }
 .cal-cell .gap-tag { margin-top: 4px; font-size: 10px; font-weight: 700; color: var(--st-fixed); }
+/* PT：有空班可搶 */
+.cal-cell.has-open { border-color: var(--st-work); background: rgba(111,176,106,0.08); }
+.cal-cell .open-tag { margin-top: 4px; font-size: 10px; font-weight: 800; color: var(--st-work); background: rgba(111,176,106,0.16); border-radius: 10px; padding: 1px 6px; display: inline-block; }
 
 /* ---------- 當天資訊面板（日曆下方） ---------- */
 .day-panel {

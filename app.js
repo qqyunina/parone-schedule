@@ -187,36 +187,36 @@ function openGaps(dateStr) {
   return gaps;
 }
 
-// 單人顧店：某時段是否和「別人」的上班時段重疊（回傳衝突者，否則 null）
+// 班別制：同一個班別（起訖完全相同）才算「同一班」。早/晚班交接重疊允許兩人並存。
+// 某班別是否已被「別人」排走（回傳排班者，否則 null）
 function conflictWorker(empId, dateStr, start, end) {
-  const s0 = toMin(start), e0 = toMin(end);
   for (const s of state.shifts) {
     if (s.work_date !== dateStr || s.status !== "work" || s.employee_id === empId) continue;
-    if (!s.start_time || !s.end_time) continue;
-    const a = toMin(s.start_time), b = toMin(s.end_time);
-    if (s0 < b && a < e0) return { emp: state.employees.find((e) => e.id === s.employee_id), s };
+    if (s.start_time === start && s.end_time === end) return { emp: state.employees.find((e) => e.id === s.employee_id), s };
   }
   return null;
 }
-// 某班別時段是否已被「排定」（approved 班表）；回傳排班者或 null
+// 某班別是否已被「排定」（approved 班表，含自己）；回傳排班者或 null
 function covererOf(dateStr, start, end) {
-  const s0 = toMin(start), e0 = toMin(end);
   for (const s of state.shifts) {
-    if (s.work_date !== dateStr || s.status !== "work" || !s.start_time || !s.end_time) continue;
-    const a = toMin(s.start_time), b = toMin(s.end_time);
-    if (s0 < b && a < e0) return state.employees.find((e) => e.id === s.employee_id) || { name: "?" };
+    if (s.work_date !== dateStr || s.status !== "work") continue;
+    if (s.start_time === start && s.end_time === end) return state.employees.find((e) => e.id === s.employee_id) || { name: "?" };
   }
   return null;
 }
-// 某班別時段是否已有「待核准的上班申請」（給其他 PT 看到已被搶）；回傳申請者或 null
+// 某班別是否已有「待核准的上班申請」（給其他 PT 看到已被搶）；回傳申請者或 null
 function requesterOf(dateStr, start, end) {
-  const s0 = toMin(start), e0 = toMin(end);
   for (const r of state.requests) {
-    if (r.work_date !== dateStr || r.req_type !== "work" || r.state !== "pending" || !r.start_time || !r.end_time) continue;
-    const a = toMin(r.start_time), b = toMin(r.end_time);
-    if (s0 < b && a < e0) return { emp: state.employees.find((e) => e.id === r.employee_id), r };
+    if (r.work_date !== dateStr || r.req_type !== "work" || r.state !== "pending") continue;
+    if (r.start_time === start && r.end_time === end) return { emp: state.employees.find((e) => e.id === r.employee_id), r };
   }
   return null;
+}
+// 某天「還可以搶」的班別（沒被排走、也沒人申請）
+function openShiftsFor(dateStr) {
+  const bh = bhFor(dateStr);
+  if (!bh || !bh.is_open) return [];
+  return (state.presets || []).filter((p) => !covererOf(dateStr, p.start_time, p.end_time) && !requesterOf(dateStr, p.start_time, p.end_time));
 }
 
 function bhFor(dateStr) {
@@ -463,6 +463,10 @@ function renderCalendar() {
     } else {
       const s = shiftOf(state.viewEmp, date);
       if (s) { const meta = statusMeta(s.status); numStyle = `background:${meta.color};color:${textOn(meta.color)}`; sub = `<div class="sub">${shiftText(s)}</div>`; }
+      else if (!state.user.is_admin) {   // PT：沒排到自己的班、又有空班別可搶 → 外層直接標「可排」
+        const open = openShiftsFor(date);
+        if (open.length) { cls.push("has-open"); sub = `<div class="open-tag">＋可排${open.length > 1 ? " " + open.length + " 班" : ""}</div>`; }
+      }
     }
     if (date === state.selectedDate) cls.push("selected");
     const dot = reqDates.has(date) ? `<span class="req-dot"></span>` : "";
@@ -1008,7 +1012,7 @@ function openShiftEditor(empId, dateStr) {
         const cf = conflictWorker(empId, ds, payload.start_time, payload.end_time);
         if (cf) {
           const who = cf.emp ? cf.emp.name : "他人";
-          const msg = `${ds} 這個時段已經有 ${who}（${cf.s.start_time}-${cf.s.end_time}），同一時間只能一個人。`;
+          const msg = `${ds} 這個班別（${cf.s.start_time}-${cf.s.end_time}）已經有 ${who} 排了。`;
           if (dates.length > 1) { skipped++; continue; }        // 多天：略過衝突日
           if (!isAdmin) { alert("⚠️ " + msg + "\n請改選還沒人排的時段。"); return; } // PT：擋
           if (!confirm("⚠️ " + msg + "\n（管理者）仍要排入嗎？")) return;              // 管理者：可強制
@@ -1102,7 +1106,7 @@ async function openRequests() {
       if (cf) {
         const who = cf.emp ? cf.emp.name : "他人";
         if (silent) return false;
-        if (!confirm(`${r.work_date} ${r.start_time}-${r.end_time} 與 ${who}（${cf.s.start_time}-${cf.s.end_time}）重疊，同一時間只能一人。仍要核准嗎？`)) return false;
+        if (!confirm(`${r.work_date} 這個班別（${cf.s.start_time}-${cf.s.end_time}）已經有 ${who} 排了。仍要核准嗎？`)) return false;
       }
     }
     await sb.from("shifts").upsert({
