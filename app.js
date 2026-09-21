@@ -168,11 +168,17 @@ function requesterOf(dateStr, start, end) {
   }
   return null;
 }
-// 某天「還可以搶」的班別（沒被排走、也沒人申請）
+// 某天「還可以搶」的班別：排班時間還有空檔、該班別能補到空檔、且沒被別人申請
 function openShiftsFor(dateStr) {
-  const bh = bhFor(dateStr);
-  if (!bh || !bh.is_open) return [];
-  return (state.presets || []).filter((p) => !covererOf(dateStr, p.start_time, p.end_time) && !requesterOf(dateStr, p.start_time, p.end_time));
+  const cw = coverWindow(dateStr);
+  if (!cw) return [];
+  const gaps = openGaps(dateStr);
+  if (!gaps.length) return [];   // 排班時間已排滿 → 沒有可排的班
+  return (state.presets || []).filter((p) => {
+    if (requesterOf(dateStr, p.start_time, p.end_time)) return false;
+    const ps = toMin(p.start_time), pe = toMin(p.end_time);
+    return gaps.some(([a, b]) => ps < b && a < pe);
+  });
 }
 
 function bhFor(dateStr) {
@@ -381,12 +387,15 @@ function renderCalendar() {
     if (closed) {
       sub = `<div class="closed-tag">公休</div>`;
     } else if (state.viewEmp === "__all__" || !state.user.is_admin) {
-      // 整店 / PT：格子上直接列出當天誰上班＋時段
+      // 整店 / PT：格子上直接列出當天誰上班＋時段（每人自己的底色）
       const workers = workersOf(date);
       if (workers.length) {
-        sub = `<div class="wlist">` + workers.map((w) =>
-          `<div class="wline"><span class="wn">${w.emp.name}</span> ${compactTime(w.s.start_time)}-${compactTime(w.s.end_time)}</div>`).join("") + `</div>`;
+        sub = `<div class="wlist">` + workers.map((w) => {
+          const col = empColor(w.emp);
+          return `<div class="wline"><span class="wn" style="background:${col};color:${textOn(col)}">${esc(w.emp.name)}</span> ${compactTime(w.s.start_time)}-${compactTime(w.s.end_time)}</div>`;
+        }).join("") + `</div>`;
       }
+      if (!state.user.is_admin && workers.some((w) => w.emp.id === state.user.id)) cls.push("cal-mine"); // 自己有班的那天
       if (state.user.is_admin) {
         const gap = uncoveredMinutes(date);
         if (gap > 0) { cls.push("gap"); sub += `<div class="gap-tag">⚠ 未排滿</div>`; }
@@ -421,17 +430,23 @@ function toast(msg) {
   requestAnimationFrame(() => t.classList.add("show"));
   setTimeout(() => t.remove(), 1500);
 }
+function qDefaultLate() {
+  // 快速排班預設選「晚班」時段（沒有晚班就用最後一個班別，再沒有就用營業時間）
+  const late = (state.presets || []).find((p) => p.label === "晚班") || (state.presets || [])[(state.presets || []).length - 1];
+  if (late) { state.quickStart = late.start_time; state.quickEnd = late.end_time; }
+  else { const bh = state.hours.find((h) => h.is_open); state.quickStart = bh ? bh.open_time : "14:00"; state.quickEnd = bh ? bh.close_time : "23:00"; }
+}
 function toggleQuick() {
   state.quickMode = !state.quickMode;
   document.body.classList.toggle("quick-on", state.quickMode);
   const btn = $("#quick-btn");
   if (btn) { btn.classList.toggle("btn-primary", state.quickMode); btn.textContent = state.quickMode ? "✓ 完成快排" : "⚡ 快速排班"; }
-  if (state.quickMode && state.selectedDate) { state.selectedDate = null; $("#day-panel").classList.add("hidden"); }
+  if (state.quickMode) { state.selectedDate = null; $("#day-panel").classList.add("hidden"); qDefaultLate(); }
   renderQuickBar();
   renderCalendar();
   // 若員工清單是空的，背景補載一次（不擋 UI），載到再刷新工具列
   if (state.quickMode && !(state.employees && state.employees.length)) {
-    loadStatic().then(() => { if (state.quickMode) renderQuickBar(); }).catch(() => {});
+    loadStatic().then(() => { if (state.quickMode) { qDefaultLate(); renderQuickBar(); } }).catch(() => {});
   }
 }
 function renderQuickBar() {
@@ -443,7 +458,7 @@ function renderQuickBar() {
     const def = state.employees.find((e) => e.id === state.user.id) || state.employees.find((e) => e.category === "正職") || state.employees[0];
     state.quickEmp = def ? def.id : null;
   }
-  if (!state._qInit) { const bh = state.hours.find((h) => h.is_open); state.quickStart = bh ? bh.open_time : "14:00"; state.quickEnd = bh ? bh.close_time : "23:00"; state._qInit = true; }
+  if (!state.quickStart || !state.quickEnd) qDefaultLate();
   const opts = timeOptions();
   bar.innerHTML =
     `<div class="qbar-row">
@@ -489,22 +504,21 @@ async function quickPaint(dateStr) {
   if (!emp) { toast("請先選人員"); return; }
   if (isClosedDate(dateStr)) { toast("公休日，略過"); return; }
   const start = state.quickStart, end = state.quickEnd;
-  const existing = shiftOf(emp.id, dateStr);
-  // 同一天同一設定再點一次 → 取消
-  if (existing && existing.status === "work" && existing.start_time === start && existing.end_time === end) {
-    await sb.from("shifts").delete().eq("id", existing.id);
-    state.shifts = state.shifts.filter((s) => s.id !== existing.id);
+  // 同一人、同一天、同一班別再點一次 → 取消（可同時有早班＋晚班）
+  const slot = state.shifts.find((s) => s.employee_id === emp.id && s.work_date === dateStr && s.status === "work" && s.start_time === start && s.end_time === end);
+  if (slot) {
+    await sb.from("shifts").delete().eq("id", slot.id);
+    state.shifts = state.shifts.filter((s) => s.id !== slot.id);
     renderCalendar(); return;
   }
   const err = validateWorkTime(dateStr, start, end);
   if (err) { toast("超出營業時間，略過"); return; }
   const cf = conflictWorker(emp.id, dateStr, start, end);
-  if (cf) { toast(`已有 ${cf.emp ? cf.emp.name : "他人"}（${cf.s.start_time}-${cf.s.end_time}）`); return; }
+  if (cf) { toast(`這個班別已有 ${cf.emp ? cf.emp.name : "他人"}`); return; }
   const { data, error } = await sb.from("shifts")
-    .upsert({ employee_id: emp.id, work_date: dateStr, status: "work", start_time: start, end_time: end, note: null }, { onConflict: "employee_id,work_date" })
+    .insert({ employee_id: emp.id, work_date: dateStr, status: "work", start_time: start, end_time: end, note: null })
     .select().maybeSingle();
   if (error) { toast("排班失敗：" + error.message); return; }
-  state.shifts = state.shifts.filter((s) => !(s.employee_id === emp.id && s.work_date === dateStr));
   if (data) state.shifts.push(data);
   renderCalendar();
 }
@@ -555,9 +569,8 @@ function renderDayPanel(dateStr) {
     panel.appendChild(gapBox);
   }
 
-  // PT 選班別：正職排完後，PT 直接點還空著的班別送出申請
+  // PT 選班別：可各自認領還空著的班別（早、晚可都上，一個班別一人）
   if (!isAdmin && !closed && _bh && _bh.is_open && state.presets.length) {
-    const myShift = shiftOf(state.user.id, dateStr);
     const box = document.createElement("div"); box.className = "dp-shifts";
     box.appendChild(frag(`<div class="dp-shifts-h">可選班別</div>`));
     state.presets.forEach((p) => {
@@ -566,22 +579,20 @@ function renderDayPanel(dateStr) {
       const requester = coverer ? null : requesterOf(dateStr, p.start_time, p.end_time);
       const row = document.createElement("div"); row.className = "shift-pick";
       if (coverer) {
-        row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-taken">已排：${esc(coverer.name)}</span>`;
+        const mine = coverer.id === state.user.id;
+        row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-taken">${mine ? "你已排 ✓" : "已排：" + esc(coverer.name)}</span>`;
       } else if (requester) {
         const who = requester.emp ? requester.emp.name : "他人";
         const mine = requester.r.employee_id === state.user.id;
         row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-pending">${mine ? "你已申請，待核准" : "已被申請：" + esc(who)}</span>`;
-      } else if (myShift) {
-        row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-open">空缺</span>`;
       } else {
         row.innerHTML = `<span class="sp-info">${info}</span>`;
-        const btn = frag(`<button class="btn btn-primary btn-sm">選這班</button>`);
+        const btn = frag(`<button class="btn btn-primary btn-sm">申請</button>`);
         btn.onclick = () => pickShift(p, dateStr);
         row.appendChild(btn);
       }
       box.appendChild(row);
     });
-    if (myShift) box.appendChild(frag(`<div class="dp-shifts-note">你當天已排：${shiftText(myShift)}（要換班請按下方自己那列的「改申請」）</div>`));
     panel.appendChild(box);
   }
 
@@ -594,71 +605,44 @@ function renderDayPanel(dateStr) {
     panel.appendChild(clip);
   }
 
-  // 要列出的名單：管理者＝全員；員工＝自己＋當天有排班/打卡的所有人（都看得到誰上班、時段）
+  // 當天班表：一個班一列（可多人、一人可早＋晚）
   const empById = (id) => state.employees.find((e) => e.id === id);
-  let rosterEmps;
-  if (isAdmin) {
-    rosterEmps = state.employees.slice();
-  } else {
-    const ids = new Set([state.user.id]);
-    state.shifts.filter((s) => s.work_date === dateStr).forEach((s) => ids.add(s.employee_id));
-    rosterEmps = [...ids].map((id) => empById(id) || { id, name: id === state.user.id ? state.user.name : "員工", category: "" });
-    rosterEmps.sort((a, b) => {
-      const ia = state.employees.findIndex((e) => e.id === a.id);
-      const ib = state.employees.findIndex((e) => e.id === b.id);
-      return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib);
-    });
-  }
-
   const ul = document.createElement("ul"); ul.className = "roster";
-  for (const emp of rosterEmps) {
-    const s = shiftOf(emp.id, dateStr);
-    const canEdit = !closed && (isAdmin || emp.id === state.user.id);
-    const li = document.createElement("li");
-    const meta = s ? statusMeta(s.status) : null;
-    const tagStyle = meta ? `background:${hexA(meta.color, 0.22)};color:${meta.color}` : "";
-    li.innerHTML = `<span class="r-name">${emp.name}</span>` +
-      (s ? `<span class="r-tag" style="${tagStyle}">${shiftText(s)}</span>` : `<span class="r-empty">未排</span>`);
-    const actions = document.createElement("span"); actions.className = "r-actions";
-    if (s && isAdmin) {   // 複製只給管理者
-      const copy = document.createElement("button"); copy.className = "r-act"; copy.textContent = "複製";
-      copy.onclick = () => { state.clipboard = { status: s.status, start_time: s.start_time, end_time: s.end_time, note: s.note }; renderDayPanel(dateStr); };
-      actions.appendChild(copy);
-    }
-    if (canEdit) {
-      if (s) {
-        const edit = document.createElement("button"); edit.className = "r-act";
-        edit.textContent = isAdmin ? "編輯" : "改申請";
-        edit.onclick = () => openShiftEditor(emp.id, dateStr);
-        actions.appendChild(edit);
-        if (isAdmin) {
-          const del = document.createElement("button"); del.className = "r-act r-del"; del.textContent = "刪除";
-          del.onclick = async () => {
-            if (!confirm(`清除 ${emp.name} 在 ${mm}月${dd}日 的班？`)) return;
-            await sb.from("shifts").delete().eq("id", s.id);
-            await loadAndRender();
-          };
-          actions.appendChild(del);
-        }
-      } else {
-        if (isAdmin && state.clipboard) {
-          const paste = document.createElement("button"); paste.className = "r-act r-paste"; paste.textContent = "貼上";
-          paste.onclick = () => pasteShift(emp.id, dateStr);
-          actions.appendChild(paste);
-        }
-        const add = document.createElement("button"); add.className = "r-act";
-        add.textContent = isAdmin ? "＋ 排班" : "＋ 申請";
-        add.onclick = () => openShiftEditor(emp.id, dateStr);
-        actions.appendChild(add);
+  if (!closed) {
+    const dayShifts = state.shifts
+      .filter((s) => s.work_date === dateStr && s.status === "work" && s.start_time && s.end_time)
+      .sort((a, b) => toMin(a.start_time) - toMin(b.start_time));
+    for (const s of dayShifts) {
+      const emp = empById(s.employee_id) || { name: "?" };
+      const col = empColor(emp);
+      const li = document.createElement("li");
+      li.innerHTML = `<span class="r-name"><span class="r-chip" style="background:${col};color:${textOn(col)}">${esc(emp.name)}</span></span>` +
+        `<span class="r-tag" style="background:${hexA(WORK_STATUS.color, 0.22)};color:${WORK_STATUS.color}">${shiftText(s)}</span>`;
+      if (isAdmin) {
+        const actions = document.createElement("span"); actions.className = "r-actions";
+        const del = document.createElement("button"); del.className = "r-act r-del"; del.textContent = "刪除";
+        del.onclick = async () => {
+          if (!confirm(`清除 ${emp.name} ${s.start_time}-${s.end_time} 的班？`)) return;
+          await sb.from("shifts").delete().eq("id", s.id); await loadAndRender();
+        };
+        actions.appendChild(del); li.appendChild(actions);
       }
+      ul.appendChild(li);
     }
-    li.appendChild(actions);
-    ul.appendChild(li);
+    if (!ul.children.length) ul.appendChild(frag(`<li class="r-empty">尚無班表</li>`));
+    if (isAdmin) {
+      const addLi = document.createElement("li"); addLi.className = "r-add-row";
+      const add = frag(`<button class="btn btn-outline btn-sm">＋ 排班</button>`);
+      add.onclick = () => openShiftEditor(null, dateStr);
+      addLi.appendChild(add); ul.appendChild(addLi);
+    }
+  } else {
+    ul.appendChild(frag(`<li class="r-empty">本日公休</li>`));
   }
-  if (!ul.children.length) ul.appendChild(frag(`<li class="r-empty">${closed ? "本日公休" : "尚無班表"}</li>`));
   panel.appendChild(ul);
   panel.classList.remove("hidden");
 }
+function empColor(emp) { return (emp && emp.color) || WORK_STATUS.color; }
 
 // 把剪貼簿的班別貼到某人（管理者直接寫入；員工送申請）
 async function pasteShift(empId, dateStr) {
@@ -670,7 +654,7 @@ async function pasteShift(empId, dateStr) {
   if (cf && !confirm(`這個班別（${cf.s.start_time}-${cf.s.end_time}）已有 ${cf.emp ? cf.emp.name : "人"}。仍要貼上？`)) return;
   await sb.from("shifts").upsert(
     { employee_id: empId, work_date: dateStr, status: "work", start_time: c.start_time, end_time: c.end_time, note: null },
-    { onConflict: "employee_id,work_date" });
+    { onConflict: "employee_id,work_date,start_time" });
   await loadAndRender();
 }
 
@@ -727,16 +711,25 @@ function editDayNote(dateStr) {
 //  排班／申請編輯器
 // ============================================================
 function openShiftEditor(empId, dateStr) {
-  const emp = state.employees.find((e) => e.id === empId);
-  const existing = shiftOf(empId, dateStr);
   const isAdmin = state.user.is_admin;
   const opts = timeOptions();
   const bh = bhFor(dateStr);
+  let curEmpId = empId || (isAdmin ? (state.employees[0] && state.employees[0].id) : state.user.id);
 
   const body = document.createElement("div");
 
-  // 常駐時段
-  body.appendChild(frag(`<p class="subhead">常駐時段（點選套用）</p>`));
+  // 選人（管理者從班表「＋排班」新增時）
+  if (isAdmin && !empId) {
+    const wrap = frag(`<label class="field"><span>員工</span></label>`);
+    const sel = document.createElement("select"); sel.className = "inp"; sel.style.width = "100%";
+    sel.innerHTML = state.employees.map((e) => `<option value="${e.id}">${esc(e.name)}（${e.category}）</option>`).join("");
+    sel.value = curEmpId || "";
+    sel.onchange = () => { curEmpId = sel.value; };
+    wrap.appendChild(sel); body.appendChild(wrap);
+  }
+
+  // 班別（點選套用）
+  body.appendChild(frag(`<p class="subhead">班別（點選套用）</p>`));
   const plist = document.createElement("div"); plist.className = "preset-list";
   body.appendChild(plist);
 
@@ -747,8 +740,8 @@ function openShiftEditor(empId, dateStr) {
   startSel.innerHTML = endSel.innerHTML = opts.map((t) => `<option>${t}</option>`).join("");
   timeRow.append(startSel, frag(`<span>—</span>`), endSel);
   body.appendChild(timeRow);
-  startSel.value = existing?.start_time || (bh ? bh.open_time : "14:00");
-  endSel.value = existing?.end_time || (bh ? bh.close_time : "23:00");
+  startSel.value = bh ? bh.open_time : "14:00";
+  endSel.value = bh ? bh.close_time : "23:00";
   if (bh && bh.is_open) body.appendChild(frag(`<p class="hint">這天營業 ${bh.open_time}–${bh.close_time}，可排 ${minToStr(toMin(bh.open_time) - 60)}–${minToStr(toMin(bh.close_time) + 60)}</p>`));
 
   // 還沒人排的時段（一鍵帶入）——單人顧店：直接選剩餘空檔
@@ -832,15 +825,11 @@ function openShiftEditor(empId, dateStr) {
   // footer
   const foot = document.createElement("div");
   foot.style.cssText = "display:flex;gap:10px;width:100%;justify-content:flex-end";
-  if (existing && isAdmin) {
-    const del = document.createElement("button"); del.className = "btn btn-danger"; del.textContent = "清除這格"; del.style.marginRight = "auto";
-    del.onclick = async () => { await sb.from("shifts").delete().eq("id", existing.id); m.close(); loadAndRender(); };
-    foot.appendChild(del);
-  }
-  const save = document.createElement("button"); save.className = "btn btn-primary"; save.textContent = isAdmin ? "儲存" : "送出申請";
+  const save = document.createElement("button"); save.className = "btn btn-primary"; save.textContent = isAdmin ? "排入" : "送出申請";
   foot.appendChild(save);
 
-  const m = openModal(`${emp.name} · ${dateStr}`, body, foot);
+  const emp0 = state.employees.find((e) => e.id === curEmpId);
+  const m = openModal(`${emp0 ? emp0.name : "排班"} · ${dateStr}`, body, foot);
 
   save.onclick = async () => {
     const start = startSel.value, end = endSel.value;
@@ -865,7 +854,7 @@ function openShiftEditor(empId, dateStr) {
     for (const ds of dates) {
       const err = validateWorkTime(ds, start, end);
       if (err) { if (dates.length === 1) { alert("⚠️ " + err); return; } skipped++; continue; }
-      const cf = conflictWorker(empId, ds, start, end);
+      const cf = conflictWorker(curEmpId, ds, start, end);
       if (cf) {
         const who = cf.emp ? cf.emp.name : "他人";
         const msg = `${ds} 這個班別（${cf.s.start_time}-${cf.s.end_time}）已經有 ${who} 排了。`;
@@ -879,14 +868,14 @@ function openShiftEditor(empId, dateStr) {
     if (dates.length > 1 && !confirm(`將${isAdmin ? "排入" : "送出申請"} ${valid.length} 天${skipped ? `（${skipped} 天略過）` : ""}，確定？`)) return;
 
     if (isAdmin) {
-      const rows = valid.map((ds) => ({ employee_id: empId, work_date: ds, status: "work", start_time: start, end_time: end, note: null }));
-      await sb.from("shifts").upsert(rows, { onConflict: "employee_id,work_date" });
+      const rows = valid.map((ds) => ({ employee_id: curEmpId, work_date: ds, status: "work", start_time: start, end_time: end, note: null }));
+      await sb.from("shifts").upsert(rows, { onConflict: "employee_id,work_date,start_time" });
       if (presetChk && presetChk.checked) {
         const nm = (presetName.value.trim()) || `${start}-${end}`;
         await addPreset(nm, start, end);
       }
     } else {
-      const reqRows = valid.map((ds) => ({ employee_id: empId, work_date: ds, req_type: "work", start_time: start, end_time: end }));
+      const reqRows = valid.map((ds) => ({ employee_id: curEmpId, work_date: ds, req_type: "work", start_time: start, end_time: end }));
       await sb.from("requests").insert(reqRows);
     }
     m.close(); await loadStatic(); loadAndRender();
@@ -930,7 +919,7 @@ async function openRequests() {
       start_time: r.req_type === "work" ? r.start_time : null,
       end_time: r.req_type === "work" ? r.end_time : null,
       note: statusMeta(r.req_type).needs_note ? r.note : null,
-    }, { onConflict: "employee_id,work_date" });
+    }, { onConflict: "employee_id,work_date,start_time" });
     await sb.from("requests").update({ state: "approved", reviewed_at: new Date().toISOString() }).eq("id", r.id);
     return true;
   }
@@ -1012,11 +1001,19 @@ function openPayrollAdmin() {
     const op = tr.querySelector(".pay-op");
     if (!pr) {
       const b = document.createElement("button"); b.className = "r-act"; b.textContent = "發放"; b.onclick = () => releaseOne(emp); op.appendChild(b);
-    } else if (pr.signed_at) {
-      const b = document.createElement("button"); b.className = "r-act"; b.style.color = "var(--st-work)"; b.textContent = "✓ 已簽收"; b.onclick = () => viewSignature(emp, pr); op.appendChild(b);
     } else {
-      op.innerHTML = `<span style="color:var(--st-fixed)">待簽收</span>`;
-      const b = document.createElement("button"); b.className = "r-act"; b.textContent = "重發"; b.onclick = () => releaseOne(emp); op.appendChild(b);
+      if (pr.signed_at) {
+        const b = document.createElement("button"); b.className = "r-act"; b.style.color = "var(--st-work)"; b.textContent = "✓ 已簽收"; b.onclick = () => viewSignature(emp, pr); op.appendChild(b);
+      } else {
+        op.appendChild(frag(`<span style="color:var(--st-fixed)">待簽收</span>`));
+        const b = document.createElement("button"); b.className = "r-act"; b.textContent = "重發"; b.onclick = () => releaseOne(emp); op.appendChild(b);
+      }
+      const clr = document.createElement("button"); clr.className = "r-act r-del"; clr.textContent = "清除";
+      clr.onclick = async () => {
+        if (!confirm(`清除 ${emp.name} 的 ${period} 薪資紀錄？（可重新發放，簽名也會刪除）`)) return;
+        await sb.from("payrolls").delete().eq("id", pr.id); m.close(); await loadAndRender(); openPayrollAdmin();
+      };
+      op.appendChild(clr);
     }
     tb.appendChild(tr);
   }
@@ -1026,8 +1023,15 @@ function openPayrollAdmin() {
   const foot = document.createElement("div"); foot.style.cssText = "display:flex;gap:10px;width:100%;justify-content:flex-end;flex-wrap:wrap";
   const exportBtn = document.createElement("button"); exportBtn.className = "btn btn-ghost"; exportBtn.textContent = "⬇ 匯出 CSV（算薪明細）"; exportBtn.style.marginRight = "auto";
   exportBtn.onclick = exportCsv;
+  const clearAll = document.createElement("button"); clearAll.className = "btn btn-ghost"; clearAll.textContent = "🗑 清除本月全部";
+  clearAll.onclick = async () => {
+    if (!confirm(`清除 ${period} 全部薪資紀錄？（測試用，可重新發放）`)) return;
+    const { error } = await sb.from("payrolls").delete().eq("period", period);
+    if (error) { alert("失敗：" + error.message); return; }
+    m.close(); await loadAndRender(); openPayrollAdmin();
+  };
   const releaseAll = document.createElement("button"); releaseAll.className = "btn btn-outline"; releaseAll.textContent = "全部一次發放";
-  foot.append(exportBtn, releaseAll);
+  foot.append(exportBtn, clearAll, releaseAll);
   const m = openModal("薪資結算", body, foot, true);
   releaseAll.onclick = async () => {
     if (!confirm(`一次發放 ${period} 全體薪資？（已簽收者不覆蓋）`)) return;
@@ -1147,15 +1151,17 @@ async function openAdmin() {
     const cat = frag(`<select class="inp"><option>正職</option><option>PT</option><option>教練</option></select>`); cat.value = e?.category || "正職";
     const pin = frag(`<input class="inp" maxlength="4" inputmode="numeric" placeholder="4 位數">`); pin.value = e?.pin || "";
     const rate = frag(`<input class="inp" type="number" placeholder="時薪">`); rate.value = e?.hourly_rate ?? 200;
+    const color = frag(`<input type="color" class="inp" style="padding:2px;height:36px;width:52px">`); color.value = e?.color || "#6fb06a";
     const adm = frag(`<input type="checkbox">`); adm.checked = !!e?.is_admin;
 
     const fName = fieldWrap("姓名", name, "fld-name");
     const fCat = fieldWrap("類別", cat, "fld-cat");
     const fPin = fieldWrap("PIN", pin, "fld-pin");
     const fRate = fieldWrap("時薪", rate, "fld-num");
+    const fColor = fieldWrap("顏色", color, "fld-cat");
     const fAdm = document.createElement("label"); fAdm.className = "fld fld-check";
     fAdm.append(adm, frag(`<span>管理者</span>`));
-    fields.append(fName, fCat, fPin, fRate, fAdm);
+    fields.append(fName, fCat, fPin, fRate, fColor, fAdm);
     card.appendChild(fields);
 
     // 正職為月薪 → 隱藏時薪欄
@@ -1166,8 +1172,10 @@ async function openAdmin() {
     const act = frag(`<button class="btn btn-sm btn-outline">${e ? "更新" : "＋ 新增員工"}</button>`);
     act.onclick = async () => {
       if (!name.value.trim() || !/^\d{4}$/.test(pin.value)) { alert("姓名必填、PIN 需 4 位數"); return; }
-      const payload = { name: name.value.trim(), category: cat.value, pin: pin.value, hourly_rate: Number(rate.value) || 0, is_admin: adm.checked };
-      const res = e ? await sb.from("employees").update(payload).eq("id", e.id) : await sb.from("employees").insert({ ...payload, active: true });
+      const payload = { name: name.value.trim(), category: cat.value, pin: pin.value, hourly_rate: Number(rate.value) || 0, is_admin: adm.checked, color: color.value };
+      const doSave = (pl) => e ? sb.from("employees").update(pl).eq("id", e.id) : sb.from("employees").insert({ ...pl, active: true });
+      let res = await doSave(payload);
+      if (res.error && /color|column|schema/i.test(res.error.message)) { const { color: _c, ...rest } = payload; res = await doSave(rest); }
       if (res.error) { alert("儲存失敗：" + res.error.message); return; }
       m.close(); await loadStatic(); loadAndRender(); openAdmin();
     };
@@ -1234,7 +1242,6 @@ async function openAdmin() {
   for (let i = 0; i < 7; i++) {
     const bh = state.hours.find((h) => h.weekday === i) || { is_open: true, open_time: "10:00", close_time: "23:00" };
     const card = document.createElement("div"); card.className = "adm-card";
-    const fields = document.createElement("div"); fields.className = "adm-fields";
     const open = frag(`<input type="checkbox">`); open.checked = bh.is_open;
     const openL = document.createElement("label"); openL.className = "fld fld-check"; openL.append(open, frag(`<span>營業</span>`));
     const o = document.createElement("select"); o.className = "inp"; o.innerHTML = opts.map((t) => `<option>${t}</option>`).join(""); o.value = bh.open_time;
@@ -1242,11 +1249,14 @@ async function openAdmin() {
     const blank = `<option value="">—</option>`;
     const so = document.createElement("select"); so.className = "inp"; so.innerHTML = blank + opts.map((t) => `<option>${t}</option>`).join(""); so.value = bh.staff_open || "";
     const sc = document.createElement("select"); sc.className = "inp"; sc.innerHTML = blank + opts.map((t) => `<option>${t}</option>`).join(""); sc.value = bh.staff_close || "";
-    fields.append(
-      frag(`<div class="fld fld-cat"><span>星期</span><div class="adm-name-lg" style="padding-top:2px">週${DOW[i]}</div></div>`), openL,
-      fieldWrap("營業開始", o, "fld-cat"), fieldWrap("營業結束", c, "fld-cat"),
-      fieldWrap("排班開始", so, "fld-cat"), fieldWrap("排班結束", sc, "fld-cat"));
-    card.appendChild(fields); bhList.appendChild(card);
+    // 第一排：星期＋是否營業；第二排：營業起訖；第三排：排班起訖（手機好讀）
+    const row1 = document.createElement("div"); row1.className = "adm-fields";
+    row1.append(frag(`<div class="fld"><span>星期</span><div class="adm-name-lg" style="padding-top:2px">週${DOW[i]}</div></div>`), openL);
+    const row2 = document.createElement("div"); row2.className = "adm-fields";
+    row2.append(fieldWrap("營業開始", o, "fld-half"), fieldWrap("營業結束", c, "fld-half"));
+    const row3 = document.createElement("div"); row3.className = "adm-fields";
+    row3.append(fieldWrap("排班開始", so, "fld-half"), fieldWrap("排班結束", sc, "fld-half"));
+    card.append(row1, row2, row3); bhList.appendChild(card);
     ctrls.push({ weekday: i, open, o, c, so, sc });
   }
   hoursPane.appendChild(bhList);
@@ -1254,12 +1264,16 @@ async function openAdmin() {
   saveBh.onclick = async () => {
     const rows = ctrls.map((x) => ({ weekday: x.weekday, is_open: x.open.checked, open_time: x.o.value, close_time: x.c.value, staff_open: x.so.value || null, staff_close: x.sc.value || null }));
     let res = await sb.from("business_hours").upsert(rows, { onConflict: "weekday" });
+    let staffDropped = false;
     if (res.error && /staff_|column|schema/i.test(res.error.message)) {
       const bare = rows.map(({ staff_open, staff_close, ...r }) => r);
       res = await sb.from("business_hours").upsert(bare, { onConflict: "weekday" });
+      staffDropped = !res.error;
     }
     if (res.error) { alert("儲存失敗：" + res.error.message); return; }
-    await loadStatic(); loadAndRender(); alert("營業時間已儲存");
+    await loadStatic(); loadAndRender();
+    if (staffDropped) alert("營業時間已存，但『排班時間』還沒生效——請先在 Supabase 跑一次 新專案_計薪時數.sql（會建立排班時間欄位），再回來設定即可保存。");
+    else alert("營業時間已儲存");
   };
   hoursPane.appendChild(saveBh);
 

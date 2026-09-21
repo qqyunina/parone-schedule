@@ -190,13 +190,13 @@ body {
 .cal-cell .wlist { width: 100%; min-width: 0; margin-top: 4px; display: flex; flex-direction: column; gap: 2px; }
 .cal-cell .wline {
   max-width: 100%;
-  font-size: 11px; line-height: 1.3; color: var(--text-dim);
-  background: rgba(111,176,106,0.14); border-radius: 4px; padding: 1px 4px;
+  font-size: 11px; line-height: 1.5; color: var(--text-dim);
   white-space: normal; overflow-wrap: break-word;
-  text-align: center;
+  text-align: center; margin-bottom: 2px;
 }
-.cal-cell .wline .wn { display: inline-block; }
-.cal-cell .wline .wn { color: var(--st-work); font-weight: 700; }
+.cal-cell .wline .wn { display: inline-block; font-weight: 700; border-radius: 6px; padding: 0 5px; }
+/* PT：自己有班的那一天 */
+.cal-cell.cal-mine { border-color: var(--amber); background: var(--amber-soft); }
 .cal-cell .note-tag {
   width: 100%; margin-top: 4px; font-size: 10px; line-height: 1.25;
   color: #f0d9a8; background: rgba(217,164,74,0.20);
@@ -310,6 +310,8 @@ body.quick-on .cal-cell:not(.blank):not(.closed):hover { outline: 2px solid var(
 .roster { list-style: none; margin: 0 0 4px; padding: 0; }
 .roster li { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--line); }
 .roster .r-name { flex: 1; }
+.roster .r-chip { display: inline-block; font-weight: 700; border-radius: 6px; padding: 2px 10px; }
+.roster .r-add-row { border-bottom: none; justify-content: flex-start; padding-top: 10px; }
 .roster .r-tag { font-size: 12px; font-weight: 700; padding: 2px 9px; border-radius: 6px; }
 .r-tag.st-work { background: rgba(111,176,106,.25); color:#a9d3a6; }
 .r-tag.st-paid { background: rgba(91,149,209,.25); color:#a9c7ea; }
@@ -340,6 +342,7 @@ table.simple input, table.simple select { width: 100%; }
 .fld .inp, .fld select.inp { width: 100%; box-sizing: border-box; }
 .fld-name { flex: 1 1 130px; }
 .fld-cat  { width: 88px; }
+.fld-half { flex: 1 1 42%; min-width: 120px; }
 .fld-pin  { width: 78px; }
 .fld-num  { width: 88px; }
 .fld-date { flex: 1 1 150px; }
