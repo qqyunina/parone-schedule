@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Parone 排班系統</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- 登入畫面 -->
+  <div id="login-screen" class="login-screen">
+    <div class="login-card">
+      <div class="brand">
+        <div class="brand-mark">PARONE</div>
+        <div class="brand-sub">排班系統</div>
+      </div>
+      <label class="field">
+        <span>選擇姓名</span>
+        <select id="login-name"></select>
+      </label>
+      <label class="field">
+        <span>PIN 碼（4 位數）</span>
+        <input id="login-pin" type="password" inputmode="numeric" maxlength="4" placeholder="••••" autocomplete="off" />
+      </label>
+      <button id="login-btn" class="btn btn-primary btn-block">登入</button>
+      <p id="login-error" class="login-error"></p>
+    </div>
+  </div>
+
+  <!-- 主畫面 -->
+  <div id="app" class="app hidden">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="logo">PARONE 排班</span>
+      </div>
+      <div class="month-nav">
+        <button id="prev-month" class="btn btn-ghost">‹</button>
+        <span id="month-label" class="month-label"></span>
+        <button id="next-month" class="btn btn-ghost">›</button>
+        <button id="today-btn" class="btn btn-ghost btn-sm">本月</button>
+      </div>
+      <div class="topbar-right">
+        <span id="who" class="who"></span>
+        <button id="payroll-btn" class="btn btn-ghost btn-sm">💰 薪資<span id="pay-badge" class="badge hidden">0</span></button>
+        <button id="requests-btn" class="btn btn-ghost btn-sm">申請<span id="req-badge" class="badge hidden">0</span></button>
+        <button id="admin-btn" class="btn btn-ghost btn-sm hidden">管理</button>
+        <button id="logout-btn" class="btn btn-ghost btn-sm">登出</button>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <label class="view-pick" id="view-pick">檢視
+        <select id="view-emp" class="inp"></select>
+      </label>
+      <button id="quick-btn" class="btn btn-outline btn-sm hidden">⚡ 快速排班</button>
+      <button id="lock-btn" class="btn btn-outline btn-sm hidden"></button>
+      <div class="legend">
+        <span class="chip chip-closed">公休</span>
+        <span class="chip chip-work">上班</span>
+        <span class="chip chip-paid">特休</span>
+        <span class="chip chip-fixed">指休</span>
+        <span class="chip chip-special">特殊</span>
+      </div>
+    </div>
+
+    <main class="cal-wrap">
+      <div class="calendar">
+        <div class="cal-dow">
+          <span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span>
+        </div>
+        <div id="cal-grid" class="cal-grid"></div>
+        <section id="day-panel" class="day-panel hidden"></section>
+      </div>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
