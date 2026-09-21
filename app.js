@@ -518,10 +518,11 @@ function renderQuickBar() {
     `<div class="qbar-row">
        <span class="qbar-label">⚡ 點日期就排</span>
        <select id="q-emp" class="inp"></select>
-       <select id="q-start" class="inp"></select><span>—</span><select id="q-end" class="inp"></select>
+       <span class="qbar-shifts" id="q-shifts"></span>
        <button id="q-done" class="btn btn-primary btn-sm">完成</button>
      </div>
-     <div class="qbar-hint">選好人和時間，直接點月曆日期就排入；同一天再點一次＝取消。公休、超出營業或和別人重疊會自動略過。</div>`;
+     <div class="qbar-row qbar-times">時段 <select id="q-start" class="inp"></select><span>—</span><select id="q-end" class="inp"></select></div>
+     <div class="qbar-hint">先選人＋班別（早/晚），直接點月曆日期就排入；同一天再點一次＝取消。公休、超出營業、同班別已有人會自動略過。</div>`;
   const empSel = bar.querySelector("#q-emp");
   if (!state.employees.length) {
     empSel.innerHTML = `<option value="">（沒有員工，請重新整理或到「管理」新增）</option>`;
@@ -532,9 +533,24 @@ function renderQuickBar() {
   empSel.onchange = () => { state.quickEmp = empSel.value; };
   const ss = bar.querySelector("#q-start"), es = bar.querySelector("#q-end");
   ss.innerHTML = es.innerHTML = opts.map((t) => `<option>${t}</option>`).join("");
-  ss.value = state.quickStart; es.value = state.quickEnd;
-  ss.onchange = () => { state.quickStart = ss.value; };
-  es.onchange = () => { state.quickEnd = es.value; };
+  const syncTimes = () => { ss.value = state.quickStart; es.value = state.quickEnd; markShift(); };
+  ss.onchange = () => { state.quickStart = ss.value; markShift(); };
+  es.onchange = () => { state.quickEnd = es.value; markShift(); };
+
+  // 班別快選（早班／晚班…）：點一下帶入時段
+  const shiftsWrap = bar.querySelector("#q-shifts");
+  function markShift() {
+    shiftsWrap.querySelectorAll(".qshift").forEach((b) => {
+      b.classList.toggle("on", b.dataset.s === state.quickStart && b.dataset.e === state.quickEnd);
+    });
+  }
+  (state.presets || []).forEach((p) => {
+    const b = document.createElement("button"); b.className = "qshift"; b.textContent = p.label;
+    b.dataset.s = p.start_time; b.dataset.e = p.end_time;
+    b.onclick = () => { state.quickStart = p.start_time; state.quickEnd = p.end_time; syncTimes(); };
+    shiftsWrap.appendChild(b);
+  });
+  syncTimes();
   bar.querySelector("#q-done").onclick = toggleQuick;
 }
 async function quickPaint(dateStr) {
