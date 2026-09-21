@@ -13,18 +13,12 @@ if (configReady) sb = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABAS
 // ---------- 常數 ----------
 const CAT_ORDER = ["正職", "PT", "教練"];
 const DOW = ["日", "一", "二", "三", "四", "五", "六"];
-// 上班為固定內建；其餘假別由 leave_types（後台可自訂）動態產生。公休為系統自動。
-const WORK_STATUS = { key: "work", label: "上班", color: "#6fb06a", needs_note: false, is_annual: false, is_monthly: false, is_comp: false };
-const SPECIAL_REASONS = ["長期出國", "留職停薪", "出差", "進修", "事假", "病假", "婚假", "產假"];
+// 上班為唯一排班狀態；公休由營業時間自動判定
+const WORK_STATUS = { key: "work", label: "上班", color: "#6fb06a" };
 
-function leaveKeys() { return (state.leaveTypes || []).map((t) => t.name); }
-function monthlyKeys() { return (state.leaveTypes || []).filter((t) => t.is_monthly).map((t) => t.name); }
-function compKeys() { return (state.leaveTypes || []).filter((t) => t.is_comp).map((t) => t.name); }
 function statusMeta(key) {
   if (key === "work") return WORK_STATUS;
-  const t = (state.leaveTypes || []).find((x) => x.name === key);
-  return t ? { key: t.name, label: t.name, color: t.color, needs_note: t.needs_note, is_annual: t.is_annual, is_monthly: !!t.is_monthly, is_comp: !!t.is_comp }
-           : { key, label: key, color: "#8a7a64", needs_note: false, is_annual: false, is_monthly: false, is_comp: false };
+  return { key, label: key, color: "#8a7a64" }; // 舊資料若有其他狀態，僅以名稱顯示
 }
 function hexA(hex, a) {
   const h = hex.replace("#", ""); const f = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
@@ -34,19 +28,6 @@ function textOn(hex) {
   const h = hex.replace("#", ""); const f = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
   const n = parseInt(f, 16); const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
   return (0.299 * r + 0.587 * g + 0.114 * b) > 150 ? "#16110d" : "#fff";
-}
-function isLocked(period) { return !!state.locks[period]; }
-const periodOf = (dateStr) => dateStr.slice(0, 7);
-
-// 某員工在目前使用者身分下「可選的狀態」
-function allowedStatusKeys(empId, dateStr) {
-  const all = ["work", ...leaveKeys()];
-  if (state.user.is_admin) return all;                    // 管理者：全部
-  const emp = state.employees.find((e) => e.id === empId);
-  let keys = all;
-  if (emp && emp.category === "PT") keys = leaveKeys().filter((k) => !statusMeta(k).is_annual); // PT：只能非特休的假
-  if (dateStr && isLocked(periodOf(dateStr))) keys = keys.filter((k) => k !== "work");           // 班表已確認→員工只能請假
-  return keys;
 }
 
 // ---------- 狀態 ----------
@@ -63,8 +44,6 @@ const state = {
   requests: [],
   dayNotes: {},   // { "2026-08-15": "包場活動 18:00" }
   payrolls: [],   // 當月薪資單
-  leaveTypes: [], // 假別（後台自訂）
-  locks: {},      // { "2026-09": true } 班表確認鎖
   quickMode: false, quickEmp: null, quickStart: null, quickEnd: null, _qInit: false, // ⚡ 快速排班
 };
 
@@ -77,45 +56,8 @@ const toMin = (t) => { const [h, m] = t.split(":").map(Number); return h * 60 + 
 const minToStr = (m) => `${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
 const todayStr = () => { const d = new Date(); return iso(d.getFullYear(), d.getMonth(), d.getDate()); };
 const periodStr = () => `${state.ym.y}-${pad(state.ym.m + 1)}`;
-const monthTotalHours = (empId) => state.shifts.filter((s) => s.employee_id === empId).reduce((t, s) => t + hoursOf(s), 0);
+const monthTotalHours = (empId) => state.shifts.filter((s) => s.employee_id === empId).reduce((t, s) => t + payHoursOf(s), 0);
 
-// 特休額度：計算某員工在「本年度週期」內某假別已用天數
-async function annualLeaveUsage(emp, statusKey) {
-  const now = new Date();
-  let start = emp.leave_start ? new Date(emp.leave_start + "T00:00:00") : new Date(now.getFullYear(), 0, 1);
-  while (new Date(start.getFullYear() + 1, start.getMonth(), start.getDate()) <= now) {
-    start = new Date(start.getFullYear() + 1, start.getMonth(), start.getDate());
-  }
-  const end = new Date(start.getFullYear() + 1, start.getMonth(), start.getDate());
-  const sIso = iso(start.getFullYear(), start.getMonth(), start.getDate());
-  const eIso = iso(end.getFullYear(), end.getMonth(), end.getDate());
-  const { data } = await sb.from("shifts").select("work_date")
-    .eq("employee_id", emp.id).eq("status", statusKey).gte("work_date", sIso).lt("work_date", eIso);
-  return { used: (data || []).length, quota: Number(emp.annual_leave_days) || 0, from: sIso, to: eIso };
-}
-
-// 某員工某月已排的「指休」（計月休上限的假別）日期
-async function monthlyOffDates(emp, period) {
-  const keys = monthlyKeys();
-  if (!keys.length) return [];
-  const [y, mm] = period.split("-").map(Number);
-  const first = `${period}-01`, last = iso(y, mm - 1, daysInMonth(y, mm - 1));
-  const { data } = await sb.from("shifts").select("work_date")
-    .eq("employee_id", emp.id).in("status", keys).gte("work_date", first).lte("work_date", last);
-  return (data || []).map((r) => r.work_date);
-}
-
-// 加班補休餘額：earned（帳本加總）− used（已排補休天數）
-async function compBalance(emp) {
-  const keys = compKeys();
-  const [led, used] = await Promise.all([
-    sb.from("comp_ledger").select("delta").eq("employee_id", emp.id),
-    keys.length ? sb.from("shifts").select("work_date").eq("employee_id", emp.id).in("status", keys) : Promise.resolve({ data: [] }),
-  ]);
-  const earned = (led.data || []).reduce((t, r) => t + Number(r.delta), 0);
-  const usedDates = (used.data || []).map((r) => r.work_date);
-  return { earned, usedDates, used: usedDates.length, balance: earned - usedDates.length };
-}
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtClock = (ts) => { if (!ts) return "—"; const d = new Date(ts); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 const fmtDateTime = (ts) => { if (!ts) return "—"; const d = new Date(ts); return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
@@ -133,6 +75,13 @@ function hoursOf(s) {
   let d = toMin(s.end_time) - toMin(s.start_time);
   if (d < 0) d += 1440;
   return d / 60;
+}
+// 計薪時數：優先用班別設定的「計薪時數」（早班4、晚班8…），沒設就用實際時數
+function payHoursOf(s) {
+  if (!s || s.status !== "work" || !s.start_time || !s.end_time) return 0;
+  const p = (state.presets || []).find((x) => x.start_time === s.start_time && x.end_time === s.end_time);
+  if (p && p.pay_hours != null && p.pay_hours !== "") return Number(p.pay_hours);
+  return hoursOf(s);
 }
 function shiftText(s) {
   if (!s) return "";
@@ -326,22 +275,14 @@ function shiftMonth(delta) {
   state.ym = { y, m }; loadAndRender();
 }
 async function loadStatic() {
-  const [emp, pre, bh, lt] = await Promise.all([
+  const [emp, pre, bh] = await Promise.all([
     sb.from("employees").select("*").eq("active", true),
     sb.from("preset_shifts").select("*").order("sort_order"),
     sb.from("business_hours").select("*").order("weekday"),
-    sb.from("leave_types").select("*").order("sort_order"),
   ]);
   state.employees = sortEmployees(emp.data || []);
   state.presets = pre.data || [];
   state.hours = bh.data || [];
-  // 假別：若尚未建表則用預設三種
-  state.leaveTypes = (lt.data && lt.data.length) ? lt.data : [
-    { name: "特休", color: "#5b95d1", needs_note: false, is_annual: true, is_monthly: false, is_comp: false, sort_order: 1 },
-    { name: "指休", color: "#d9584f", needs_note: false, is_annual: false, is_monthly: true, is_comp: false, sort_order: 2 },
-    { name: "特殊", color: "#a678d6", needs_note: true, is_annual: false, is_monthly: false, is_comp: false, sort_order: 3 },
-    { name: "補休", color: "#e0a458", needs_note: false, is_annual: false, is_monthly: false, is_comp: true, sort_order: 4 },
-  ];
   updateLegend();
   // 檢視下拉
   const sel = $("#view-emp");
@@ -358,27 +299,10 @@ function sortEmployees(list) {
     return a.name.localeCompare(b.name);
   });
 }
-function renderLockBtn() {
-  const btn = $("#lock-btn");
-  if (!btn || !state.user.is_admin) return;
-  btn.classList.remove("hidden");
-  const locked = isLocked(periodOf(iso(state.ym.y, state.ym.m, 1)));
-  btn.textContent = locked ? "🔒 班表已確認（點解除）" : "🔓 確認本月班表";
-  btn.classList.toggle("btn-primary", locked);
-  btn.onclick = async () => {
-    const period = `${state.ym.y}-${pad(state.ym.m + 1)}`;
-    const next = !locked;
-    if (!confirm(next ? `確認 ${period} 班表？確認後員工在這個月只能「請假」，不能自行加班別。` : `解除 ${period} 班表確認？`)) return;
-    const { error } = await sb.from("schedule_locks").upsert({ period, locked: next, locked_at: new Date().toISOString() }, { onConflict: "period" });
-    if (error) { alert("失敗（可能尚未跑 sql_進階.sql）：" + error.message); return; }
-    await loadAndRender();
-  };
-}
 function updateLegend() {
   const el = document.querySelector(".legend");
   if (!el) return;
-  const items = [{ label: "公休", color: "#b08968" }, { label: "上班", color: WORK_STATUS.color },
-    ...(state.leaveTypes || []).map((t) => ({ label: t.name, color: t.color }))];
+  const items = [{ label: "公休", color: "#b08968" }, { label: "上班", color: WORK_STATUS.color }];
   el.innerHTML = items.map((i) =>
     `<span class="chip" style="background:${i.color};color:${textOn(i.color)}">${esc(i.label)}</span>`).join("");
 }
@@ -387,20 +311,17 @@ async function loadAndRender() {
   const period = `${y}-${pad(m + 1)}`;
   $("#month-label").textContent = `${y} 年 ${m + 1} 月`;
   const first = iso(y, m, 1), last = iso(y, m, daysInMonth(y, m));
-  const [sh, rq, dn, pr, lk] = await Promise.all([
+  const [sh, rq, dn, pr] = await Promise.all([
     sb.from("shifts").select("*").gte("work_date", first).lte("work_date", last),
     sb.from("requests").select("*").eq("state", "pending"),
     sb.from("day_notes").select("*").gte("work_date", first).lte("work_date", last),
     sb.from("payrolls").select("*").eq("period", period),
-    sb.from("schedule_locks").select("*").eq("period", period).maybeSingle(),
   ]);
   state.shifts = sh.data || [];
   state.requests = rq.data || [];
   state.dayNotes = {};
   (dn.data || []).forEach((r) => { state.dayNotes[r.work_date] = r.note; });
   state.payrolls = pr.data || [];
-  state.locks[period] = !!(lk.data && lk.data.locked);
-  renderLockBtn();
   renderBadge();
   renderCalendar();
   if (state.selectedDate && state.selectedDate.startsWith(iso(y, m, 1).slice(0, 7))) renderDayPanel(state.selectedDate);
@@ -465,7 +386,7 @@ function renderCalendar() {
       if (s) { const meta = statusMeta(s.status); numStyle = `background:${meta.color};color:${textOn(meta.color)}`; sub = `<div class="sub">${shiftText(s)}</div>`; }
       else if (!state.user.is_admin) {   // PT：沒排到自己的班、又有空班別可搶 → 外層直接標「可排」
         const open = openShiftsFor(date);
-        if (open.length) { cls.push("has-open"); sub = `<div class="open-tag">＋可排${open.length > 1 ? " " + open.length + " 班" : ""}</div>`; }
+        if (open.length) { cls.push("has-open"); sub = open.map((p) => `<div class="open-tag">＋${esc(p.label)}</div>`).join(""); }
       }
     }
     if (date === state.selectedDate) cls.push("selected");
@@ -695,10 +616,9 @@ function renderDayPanel(dateStr) {
       actions.appendChild(copy);
     }
     if (canEdit) {
-      const locked = isLocked(periodOf(dateStr));
       if (s) {
         const edit = document.createElement("button"); edit.className = "r-act";
-        edit.textContent = isAdmin ? "編輯" : (locked ? "請假" : "改申請");
+        edit.textContent = isAdmin ? "編輯" : "改申請";
         edit.onclick = () => openShiftEditor(emp.id, dateStr);
         actions.appendChild(edit);
         if (isAdmin) {
@@ -717,7 +637,7 @@ function renderDayPanel(dateStr) {
           actions.appendChild(paste);
         }
         const add = document.createElement("button"); add.className = "r-act";
-        add.textContent = isAdmin ? "＋ 排班" : (locked ? "請假" : "＋ 申請");
+        add.textContent = isAdmin ? "＋ 排班" : "＋ 申請";
         add.onclick = () => openShiftEditor(emp.id, dateStr);
         actions.appendChild(add);
       }
@@ -734,39 +654,13 @@ function renderDayPanel(dateStr) {
 async function pasteShift(empId, dateStr) {
   const c = state.clipboard;
   if (!c) return;
-  const isAdmin = state.user.is_admin;
-  if (!isAdmin && !allowedStatusKeys(empId, dateStr).includes(c.status)) {
-    alert(`這個身分不能登記「${statusMeta(c.status).label}」`); return;
-  }
-  if (c.status === "work") {
-    const err = validateWorkTime(dateStr, c.start_time, c.end_time);
-    if (err) { alert("⚠️ " + err); return; }
-  }
-  const emp = state.employees.find((e) => e.id === empId);
-  if (emp && statusMeta(c.status).is_annual) {
-    const q = await annualLeaveUsage(emp, c.status);
-    if (q.quota > 0 && q.used + 1 > q.quota && !confirm(`${emp.name} 的「${c.status}」本年度已用 ${q.used}/${q.quota} 天，這次會超過額度。仍要排？`)) return;
-  }
-  if (emp && statusMeta(c.status).is_monthly && emp.category === "正職" && Number(emp.monthly_off_days) > 0) {
-    const existing = (await monthlyOffDates(emp, periodOf(dateStr))).filter((d) => d !== dateStr).length;
-    if (existing + 1 > Number(emp.monthly_off_days) && !confirm(`${emp.name} ${periodOf(dateStr)} 指休已排 ${existing}/${emp.monthly_off_days} 天，這次會超過。仍要排？`)) return;
-  }
-  if (emp && statusMeta(c.status).is_comp) {
-    const cbal = await compBalance(emp);
-    const usedOther = cbal.usedDates.filter((d) => d !== dateStr).length;
-    if (1 > cbal.earned - usedOther && !confirm(`${emp.name} 的補休餘額 ${cbal.earned - usedOther} 天，這次會超過。仍要排？`)) return;
-  }
-  if (isAdmin) {
-    await sb.from("shifts").upsert(
-      { employee_id: empId, work_date: dateStr, status: c.status, start_time: c.start_time, end_time: c.end_time, note: c.note },
-      { onConflict: "employee_id,work_date" });
-  } else {
-    await sb.from("requests").insert({
-      employee_id: empId, work_date: dateStr, req_type: c.status,
-      start_time: c.status === "work" ? c.start_time : null,
-      end_time: c.status === "work" ? c.end_time : null, note: c.note,
-    });
-  }
+  const err = validateWorkTime(dateStr, c.start_time, c.end_time);
+  if (err) { alert("⚠️ " + err); return; }
+  const cf = conflictWorker(empId, dateStr, c.start_time, c.end_time);
+  if (cf && !confirm(`這個班別（${cf.s.start_time}-${cf.s.end_time}）已有 ${cf.emp ? cf.emp.name : "人"}。仍要貼上？`)) return;
+  await sb.from("shifts").upsert(
+    { employee_id: empId, work_date: dateStr, status: "work", start_time: c.start_time, end_time: c.end_time, note: null },
+    { onConflict: "employee_id,work_date" });
   await loadAndRender();
 }
 
@@ -836,37 +730,6 @@ function openShiftEditor(empId, dateStr) {
   const plist = document.createElement("div"); plist.className = "preset-list";
   body.appendChild(plist);
 
-  // 狀態（依身分/類別/班表鎖限制可選項）
-  const allowed = allowedStatusKeys(empId, dateStr);
-  body.appendChild(frag(`<p class="subhead">狀態</p>`));
-  const choiceRow = document.createElement("div"); choiceRow.className = "choice-row";
-  let curStatus = existing && allowed.includes(existing.status) ? existing.status : allowed[0];
-  const btns = {};
-  allowed.forEach((k) => {
-    const meta = statusMeta(k);
-    const b = document.createElement("button");
-    b.className = "choice";
-    b.innerHTML = `<span class="dot" style="background:${meta.color}"></span>${meta.label}`;
-    b.onclick = () => setStatus(k);
-    choiceRow.appendChild(b); btns[k] = b;
-  });
-  body.appendChild(choiceRow);
-  if (!isAdmin && emp.category === "PT") body.appendChild(frag(`<p class="hint">PT 只能登記休假（不含特休）</p>`));
-  if (!isAdmin && isLocked(periodOf(dateStr))) body.appendChild(frag(`<p class="hint">本月班表已確認，只能申請請假</p>`));
-  if (emp.category === "正職") {
-    const info = frag(`<p class="hint" style="color:var(--amber)">載入額度中…</p>`);
-    body.appendChild(info);
-    (async () => {
-      const parts = [];
-      if (Number(emp.monthly_off_days) > 0 && monthlyKeys().length) {
-        const used = (await monthlyOffDates(emp, periodOf(dateStr))).length;
-        parts.push(`本月指休 ${used}/${emp.monthly_off_days} 天`);
-      }
-      if (compKeys().length) { const cb = await compBalance(emp); parts.push(`補休餘額 ${cb.balance} 天`); }
-      info.textContent = parts.length ? "📊 " + parts.join("　·　") : "";
-    })();
-  }
-
   // 時段
   const timeRow = document.createElement("div"); timeRow.className = "time-row";
   const startSel = document.createElement("select"); startSel.className = "inp";
@@ -887,55 +750,32 @@ function openShiftEditor(empId, dateStr) {
     gaps.forEach(([a, b]) => {
       const gb = document.createElement("button"); gb.className = "choice";
       gb.innerHTML = `<span class="dot" style="background:var(--st-work)"></span>${minToStr(a)}-${minToStr(b)}`;
-      gb.onclick = () => { setStatus("work"); startSel.value = minToStr(a); endSel.value = minToStr(b); };
+      gb.onclick = () => { startSel.value = minToStr(a); endSel.value = minToStr(b); };
       gapRow.appendChild(gb);
     });
     gapWrap.appendChild(gapRow); body.appendChild(gapWrap);
   }
 
-  // 特殊備註
-  const noteWrap = document.createElement("div");
-  noteWrap.innerHTML = `<p class="subhead">備註（特殊狀態）</p>`;
-  const noteInp = document.createElement("input"); noteInp.className = "inp"; noteInp.style.width = "100%";
-  noteInp.placeholder = "例如：長期出國、支援他店…"; noteInp.value = existing?.note || "";
-  noteWrap.appendChild(noteInp);
-  const reasonRow = document.createElement("div"); reasonRow.className = "choice-row"; reasonRow.style.marginTop = "8px";
-  SPECIAL_REASONS.forEach((r) => {
-    const b = document.createElement("button"); b.className = "choice"; b.style.fontSize = "12px"; b.style.padding = "6px 9px";
-    b.textContent = r; b.onclick = () => { noteInp.value = r; };
-    reasonRow.appendChild(b);
-  });
-  noteWrap.appendChild(reasonRow);
-  body.appendChild(noteWrap);
-
-  // 設為常駐（管理者）
+  // 設為班別選項（管理者）
   let presetChk = null, presetName = null;
   if (isAdmin) {
     const wrap = document.createElement("div");
     const cr = document.createElement("label"); cr.className = "check-row";
-    cr.innerHTML = `<input type="checkbox"/> 把這個時段設為常駐選項`;
+    cr.innerHTML = `<input type="checkbox"/> 把這個時段設為班別選項`;
     presetChk = cr.querySelector("input");
-    presetName = document.createElement("input"); presetName.className = "inp"; presetName.placeholder = "常駐名稱（例：早班）"; presetName.style.width = "100%"; presetName.style.marginTop = "6px"; presetName.style.display = "none";
+    presetName = document.createElement("input"); presetName.className = "inp"; presetName.placeholder = "班別名稱（例：早班）"; presetName.style.width = "100%"; presetName.style.marginTop = "6px"; presetName.style.display = "none";
     presetChk.onchange = () => { presetName.style.display = presetChk.checked ? "block" : "none"; };
     wrap.append(cr, presetName); body.appendChild(wrap);
   }
 
-  function setStatus(k) {
-    curStatus = k;
-    Object.entries(btns).forEach(([kk, bb]) => bb.classList.toggle("selected", kk === k));
-    timeRow.style.display = k === "work" ? "flex" : "none";
-    noteWrap.style.display = statusMeta(k).needs_note ? "block" : "none";
-    if (presetChk) presetChk.parentElement.parentElement.style.display = k === "work" ? "block" : "none";
-  }
-
   function renderPresets() {
     plist.innerHTML = "";
-    if (!state.presets.length) { plist.appendChild(frag(`<p class="hint">尚無常駐時段</p>`)); return; }
+    if (!state.presets.length) { plist.appendChild(frag(`<p class="hint">尚無班別</p>`)); return; }
     state.presets.forEach((p) => {
       const item = document.createElement("div"); item.className = "preset-item";
       const b = document.createElement("button"); b.className = "choice"; b.style.flex = "1"; b.style.justifyContent = "flex-start";
       b.innerHTML = `<span class="dot" style="background:var(--st-work)"></span>${p.label}　<span style="color:var(--text-mute);font-weight:400">${p.start_time}-${p.end_time}</span>`;
-      b.onclick = () => { setStatus("work"); startSel.value = p.start_time; endSel.value = p.end_time; markPreset(p.id); };
+      b.onclick = () => { startSel.value = p.start_time; endSel.value = p.end_time; markPreset(p.id); };
       item.appendChild(b);
       if (isAdmin) {
         const del = document.createElement("button"); del.className = "p-del"; del.textContent = "🗑"; del.title = "刪除";
@@ -952,7 +792,6 @@ function openShiftEditor(empId, dateStr) {
     if (idx >= 0 && items[idx]) items[idx].querySelector(".choice").classList.add("selected");
   }
   renderPresets();
-  setStatus(curStatus);
 
   // ---- 套用到多天（直接在排班當下設定，免另開批次） ----
   body.appendChild(frag(`<div class="divider"></div>`));
@@ -994,99 +833,50 @@ function openShiftEditor(empId, dateStr) {
   const m = openModal(`${emp.name} · ${dateStr}`, body, foot);
 
   save.onclick = async () => {
-    const needsNote = statusMeta(curStatus).needs_note;
-    const payload = {
-      status: curStatus,
-      start_time: curStatus === "work" ? startSel.value : null,
-      end_time: curStatus === "work" ? endSel.value : null,
-      note: needsNote ? noteInp.value.trim() : null,
-    };
-    if (needsNote && !payload.note) { alert(`「${statusMeta(curStatus).label}」請填寫備註`); return; }
-
+    const start = startSel.value, end = endSel.value;
     // 目標日期：單天 or 多天
     let dates = [dateStr];
     if (multiChk.checked) {
-      const start = new Date(dateStr + "T00:00:00"), end = new Date(endInp.value + "T00:00:00");
-      if (isNaN(end) || end < start) { alert("結束日期需在開始日期之後"); return; }
+      const s0 = new Date(dateStr + "T00:00:00"), e0 = new Date(endInp.value + "T00:00:00");
+      if (isNaN(e0) || e0 < s0) { alert("結束日期需在開始日期之後"); return; }
       const wd = wchecks.map((c, i) => (c.checked ? i : -1)).filter((i) => i >= 0);
       if (!wd.length) { alert("請至少勾一個星期"); return; }
       dates = [];
-      let cur = new Date(start);
-      while (cur <= end) {
+      let cur = new Date(s0);
+      while (cur <= e0) {
         const ds = iso(cur.getFullYear(), cur.getMonth(), cur.getDate());
         if (wd.includes(cur.getDay()) && !isClosedDate(ds)) dates.push(ds);
         cur.setDate(cur.getDate() + 1);
       }
     }
 
-    // 逐日驗證營業時間 + 單人顧店防重疊（上班才需要）
+    // 逐日驗證營業時間 + 同班別防重複
     let skipped = 0; const valid = [];
     for (const ds of dates) {
-      if (curStatus === "work") {
-        const err = validateWorkTime(ds, payload.start_time, payload.end_time);
-        if (err) { if (dates.length === 1) { alert("⚠️ " + err); return; } skipped++; continue; }
-        const cf = conflictWorker(empId, ds, payload.start_time, payload.end_time);
-        if (cf) {
-          const who = cf.emp ? cf.emp.name : "他人";
-          const msg = `${ds} 這個班別（${cf.s.start_time}-${cf.s.end_time}）已經有 ${who} 排了。`;
-          if (dates.length > 1) { skipped++; continue; }        // 多天：略過衝突日
-          if (!isAdmin) { alert("⚠️ " + msg + "\n請改選還沒人排的時段。"); return; } // PT：擋
-          if (!confirm("⚠️ " + msg + "\n（管理者）仍要排入嗎？")) return;              // 管理者：可強制
-        }
+      const err = validateWorkTime(ds, start, end);
+      if (err) { if (dates.length === 1) { alert("⚠️ " + err); return; } skipped++; continue; }
+      const cf = conflictWorker(empId, ds, start, end);
+      if (cf) {
+        const who = cf.emp ? cf.emp.name : "他人";
+        const msg = `${ds} 這個班別（${cf.s.start_time}-${cf.s.end_time}）已經有 ${who} 排了。`;
+        if (dates.length > 1) { skipped++; continue; }
+        if (!isAdmin) { alert("⚠️ " + msg + "\n請改選還沒人排的班別。"); return; }
+        if (!confirm("⚠️ " + msg + "\n（管理者）仍要排入嗎？")) return;
       }
       valid.push(ds);
     }
     if (!valid.length) { alert("沒有可套用的日期（可能都超出營業時間或公休）"); return; }
-
-    // 特休額度檢查
-    if (statusMeta(curStatus).is_annual) {
-      const q = await annualLeaveUsage(emp, curStatus);
-      if (q.quota > 0 && q.used + valid.length > q.quota) {
-        const msg = `${emp.name} 的「${curStatus}」本年度額度 ${q.quota} 天，已用 ${q.used} 天，這次 ${valid.length} 天會超過。`;
-        if (!isAdmin) { alert("⚠️ " + msg + "\n請洽管理者。"); return; }
-        if (!confirm("⚠️ " + msg + "\n（管理者）仍要排入嗎？")) return;
-      }
-    }
-
-    // 每月指休上限（僅正職、且有設上限）
-    if (statusMeta(curStatus).is_monthly && emp.category === "正職" && Number(emp.monthly_off_days) > 0) {
-      const validSet = new Set(valid);
-      const byMonth = {};
-      valid.forEach((ds) => { const p = periodOf(ds); (byMonth[p] = byMonth[p] || 0), byMonth[p]++; });
-      for (const p of Object.keys(byMonth)) {
-        const existing = (await monthlyOffDates(emp, p)).filter((d) => !validSet.has(d)).length;
-        if (existing + byMonth[p] > Number(emp.monthly_off_days)) {
-          const msg = `${emp.name} ${p} 的指休上限 ${emp.monthly_off_days} 天，已排 ${existing} 天，這次再排 ${byMonth[p]} 天會超過。`;
-          if (!isAdmin) { alert("⚠️ " + msg + "\n請洽管理者。"); return; }
-          if (!confirm("⚠️ " + msg + "\n（管理者）仍要排入嗎？")) return;
-        }
-      }
-    }
-
-    // 加班補休餘額檢查
-    if (statusMeta(curStatus).is_comp) {
-      const validSet = new Set(valid);
-      const cb = await compBalance(emp);
-      const usedOther = cb.usedDates.filter((d) => !validSet.has(d)).length;
-      const remain = cb.earned - usedOther;
-      if (valid.length > remain) {
-        const msg = `${emp.name} 的補休餘額 ${remain} 天（加班取得 ${cb.earned}、已用 ${usedOther}），這次休 ${valid.length} 天會超過。`;
-        if (!isAdmin) { alert("⚠️ " + msg + "\n請洽管理者確認加班補休。"); return; }
-        if (!confirm("⚠️ " + msg + "\n（管理者）仍要排入嗎？")) return;
-      }
-    }
-
-    if (dates.length > 1 && !confirm(`將${isAdmin ? "排入" : "送出申請"} ${valid.length} 天${skipped ? `（${skipped} 天超出營業時間略過）` : ""}，確定？`)) return;
+    if (dates.length > 1 && !confirm(`將${isAdmin ? "排入" : "送出申請"} ${valid.length} 天${skipped ? `（${skipped} 天略過）` : ""}，確定？`)) return;
 
     if (isAdmin) {
-      const rows = valid.map((ds) => ({ employee_id: empId, work_date: ds, ...payload }));
+      const rows = valid.map((ds) => ({ employee_id: empId, work_date: ds, status: "work", start_time: start, end_time: end, note: null }));
       await sb.from("shifts").upsert(rows, { onConflict: "employee_id,work_date" });
-      if (presetChk && presetChk.checked && curStatus === "work") {
-        const nm = (presetName.value.trim()) || `${payload.start_time}-${payload.end_time}`;
-        await addPreset(nm, payload.start_time, payload.end_time);
+      if (presetChk && presetChk.checked) {
+        const nm = (presetName.value.trim()) || `${start}-${end}`;
+        await addPreset(nm, start, end);
       }
     } else {
-      const reqRows = valid.map((ds) => ({ employee_id: empId, work_date: ds, req_type: curStatus, start_time: payload.start_time, end_time: payload.end_time, note: payload.note }));
+      const reqRows = valid.map((ds) => ({ employee_id: empId, work_date: ds, req_type: "work", start_time: start, end_time: end }));
       await sb.from("requests").insert(reqRows);
     }
     m.close(); await loadStatic(); loadAndRender();
@@ -1324,12 +1114,9 @@ function signaturePad(container) {
 // ============================================================
 async function openAdmin() {
   const { data: allEmp } = await sb.from("employees").select("*").order("category").order("sort_order");
-  const ltRes = await sb.from("leave_types").select("*").order("sort_order");
-  const compLed = await sb.from("comp_ledger").select("*").order("created_at", { ascending: false });
-  const compUsed = compKeys().length ? await sb.from("shifts").select("employee_id,work_date,status").in("status", compKeys()) : { data: [] };
   const body = document.createElement("div");
 
-  body.appendChild(frag(`<p class="subhead">員工管理（時薪僅 PT／教練；特休天＝正職年度額度，起算日＝特休年度起點，月指休＝正職每月指休上限，0＝不限）</p>`));
+  body.appendChild(frag(`<p class="subhead">員工管理（時薪僅 PT／教練用；正職為月薪不填時薪）</p>`));
   const empList = document.createElement("div"); empList.className = "adm-list";
 
   function empCard(e) {
@@ -1339,41 +1126,28 @@ async function openAdmin() {
     const cat = frag(`<select class="inp"><option>正職</option><option>PT</option><option>教練</option></select>`); cat.value = e?.category || "正職";
     const pin = frag(`<input class="inp" maxlength="4" inputmode="numeric" placeholder="4 位數">`); pin.value = e?.pin || "";
     const rate = frag(`<input class="inp" type="number" placeholder="時薪">`); rate.value = e?.hourly_rate ?? 200;
-    const annual = frag(`<input class="inp" type="number" min="0">`); annual.value = e?.annual_leave_days ?? 0;
-    const lstart = frag(`<input class="inp" type="date">`); if (e?.leave_start) lstart.value = e.leave_start;
-    const monthlyOff = frag(`<input class="inp" type="number" min="0">`); monthlyOff.value = e?.monthly_off_days ?? 0;
     const adm = frag(`<input type="checkbox">`); adm.checked = !!e?.is_admin;
 
     const fName = fieldWrap("姓名", name, "fld-name");
     const fCat = fieldWrap("類別", cat, "fld-cat");
     const fPin = fieldWrap("PIN", pin, "fld-pin");
     const fRate = fieldWrap("時薪", rate, "fld-num");
-    const fAnnual = fieldWrap("特休天", annual, "fld-num");
-    const fStart = fieldWrap("特休起算日", lstart, "fld-date");
-    const fMonthly = fieldWrap("每月指休上限", monthlyOff, "fld-num");
     const fAdm = document.createElement("label"); fAdm.className = "fld fld-check";
     fAdm.append(adm, frag(`<span>管理者</span>`));
-    fields.append(fName, fCat, fPin, fRate, fAnnual, fStart, fMonthly, fAdm);
+    fields.append(fName, fCat, fPin, fRate, fAdm);
     card.appendChild(fields);
 
-    // 正職＝月薪＋有特休/月指休（隱藏時薪、顯示特休欄）；非正職相反
-    const syncFT = () => {
-      const isFT = cat.value === "正職";
-      fRate.style.display = isFT ? "none" : "";
-      fAnnual.style.display = isFT ? "" : "none";
-      fStart.style.display = isFT ? "" : "none";
-      fMonthly.style.display = isFT ? "" : "none";
-    };
-    cat.onchange = syncFT; syncFT();
+    // 正職為月薪 → 隱藏時薪欄
+    const syncRate = () => { fRate.style.display = cat.value === "正職" ? "none" : ""; };
+    cat.onchange = syncRate; syncRate();
 
     const foot = document.createElement("div"); foot.className = "adm-foot";
     const act = frag(`<button class="btn btn-sm btn-outline">${e ? "更新" : "＋ 新增員工"}</button>`);
     act.onclick = async () => {
       if (!name.value.trim() || !/^\d{4}$/.test(pin.value)) { alert("姓名必填、PIN 需 4 位數"); return; }
-      const isFT = cat.value === "正職";
-      const payload = { name: name.value.trim(), category: cat.value, pin: pin.value, hourly_rate: Number(rate.value) || 0, is_admin: adm.checked, annual_leave_days: isFT ? (Number(annual.value) || 0) : 0, leave_start: isFT ? (lstart.value || null) : null, monthly_off_days: isFT ? (Number(monthlyOff.value) || 0) : 0 };
+      const payload = { name: name.value.trim(), category: cat.value, pin: pin.value, hourly_rate: Number(rate.value) || 0, is_admin: adm.checked };
       const res = e ? await sb.from("employees").update(payload).eq("id", e.id) : await sb.from("employees").insert({ ...payload, active: true });
-      if (res.error) { alert("儲存失敗（特休/月指休欄位需先跑 sql_正職補休.sql）：" + res.error.message); return; }
+      if (res.error) { alert("儲存失敗：" + res.error.message); return; }
       m.close(); await loadStatic(); loadAndRender(); openAdmin();
     };
     foot.appendChild(act);
@@ -1393,97 +1167,9 @@ async function openAdmin() {
   empList.appendChild(empCard(null));
   body.appendChild(empList);
 
-  // ---- 加班補休額度（正職）----
-  body.appendChild(frag(`<div class="divider"></div>`));
-  body.appendChild(frag(`<p class="subhead">加班補休額度（正職）：加班時在這裡記一筆（＋天數），員工休「補休」會自動扣抵</p>`));
-  if (compLed.error) {
-    body.appendChild(frag(`<p class="hint warn">尚未建立補休帳本，請先在 Supabase 跑 sql_正職補休.sql</p>`));
-  } else {
-    const ftEmps = (allEmp || []).filter((e) => e.category === "正職");
-    if (!ftEmps.length) body.appendChild(frag(`<p class="hint">目前沒有正職員工</p>`));
-    else {
-      const compList = document.createElement("div"); compList.className = "adm-list";
-      ftEmps.forEach((e) => {
-        const earned = (compLed.data || []).filter((r) => r.employee_id === e.id).reduce((t, r) => t + Number(r.delta), 0);
-        const used = (compUsed.data || []).filter((r) => r.employee_id === e.id).length;
-        const bal = earned - used;
-        const card = document.createElement("div"); card.className = "adm-card";
-        card.appendChild(frag(`<div class="adm-name-lg">${esc(e.name)}</div>`));
-        card.appendChild(frag(`<div class="adm-stat">取得 <b>${earned}</b> 天　·　已用 <b>${used}</b> 天　·　剩餘 <b>${bal}</b> 天</div>`));
-        const fields = document.createElement("div"); fields.className = "adm-fields";
-        const days = frag(`<input class="inp" type="number" step="0.5" placeholder="+1">`);
-        const note = frag(`<input class="inp" placeholder="例：6/1 加班 2 小時">`);
-        fields.append(fieldWrap("加班天數", days, "fld-num"), fieldWrap("事由", note, "fld-grow"));
-        card.appendChild(fields);
-        const foot = document.createElement("div"); foot.className = "adm-foot";
-        const add = frag(`<button class="btn btn-sm btn-outline">記一筆</button>`);
-        add.onclick = async () => {
-          const d = Number(days.value);
-          if (!d) { alert("請填加班天數（可負數做調整）"); return; }
-          const { error } = await sb.from("comp_ledger").insert({ employee_id: e.id, delta: d, note: note.value.trim() });
-          if (error) { alert("失敗：" + error.message); return; }
-          m.close(); openAdmin();
-        };
-        foot.appendChild(add); card.appendChild(foot);
-        compList.appendChild(card);
-      });
-      body.appendChild(compList);
-    }
-  }
-
-  // ---- 假別設定 ----
-  body.appendChild(frag(`<div class="divider"></div>`));
-  body.appendChild(frag(`<p class="subhead">假別設定（名稱是班表存的值；「計特休」＝計入特休額度；「需備註」＝像特殊需填原因）</p>`));
-  if (ltRes.error) {
-    body.appendChild(frag(`<p class="hint warn">尚未建立假別表，請先在 Supabase 跑 sql_進階.sql</p>`));
-  } else {
-    const ltList = document.createElement("div"); ltList.className = "adm-list";
-    const mkChk = (label, checked) => {
-      const l = document.createElement("label"); l.className = "fld fld-check";
-      const c = frag(`<input type="checkbox">`); c.checked = !!checked;
-      l.append(c, frag(`<span>${label}</span>`)); return { l, c };
-    };
-    function ltCard(t) {
-      const card = document.createElement("div"); card.className = "adm-card";
-      const fields = document.createElement("div"); fields.className = "adm-fields";
-      const name = frag(`<input class="inp" placeholder="假別名稱">`); name.value = t?.name || "";
-      const color = frag(`<input type="color" class="inp" style="padding:2px;height:36px;width:52px">`); color.value = t?.color || "#8a7a64";
-      const nn = mkChk("需備註", t?.needs_note);
-      const ann = mkChk("計特休", t?.is_annual);
-      const mon = mkChk("計月休", t?.is_monthly);
-      const comp = mkChk("計補休", t?.is_comp);
-      fields.append(fieldWrap("名稱", name, "fld-grow"), fieldWrap("顏色", color, "fld-cat"), nn.l, ann.l, mon.l, comp.l);
-      card.appendChild(fields);
-      const foot = document.createElement("div"); foot.className = "adm-foot";
-      const act = frag(`<button class="btn btn-sm btn-outline">${t ? "更新" : "＋ 新增假別"}</button>`);
-      act.onclick = async () => {
-        if (!name.value.trim()) { alert("請填假別名稱"); return; }
-        const payload = { name: name.value.trim(), color: color.value, needs_note: nn.c.checked, is_annual: ann.c.checked, is_monthly: mon.c.checked, is_comp: comp.c.checked, sort_order: t?.sort_order ?? 99 };
-        const res = t ? await sb.from("leave_types").update(payload).eq("id", t.id) : await sb.from("leave_types").insert(payload);
-        if (res.error) { alert("失敗（可能尚未跑 sql_正職補休.sql）：" + res.error.message); return; }
-        m.close(); await loadStatic(); loadAndRender(); openAdmin();
-      };
-      foot.appendChild(act);
-      if (t) {
-        const del = frag(`<button class="p-del" title="刪除">🗑</button>`);
-        del.onclick = async () => {
-          if (!confirm(`刪除假別「${t.name}」？（已排的資料仍會顯示此名稱）`)) return;
-          await sb.from("leave_types").delete().eq("id", t.id);
-          m.close(); await loadStatic(); loadAndRender(); openAdmin();
-        };
-        foot.appendChild(del);
-      }
-      card.appendChild(foot);
-      return card;
-    }
-    (ltRes.data || []).forEach((t) => ltList.appendChild(ltCard(t)));
-    ltList.appendChild(ltCard(null));
-    body.appendChild(ltList);
-  }
-
   // ---- 班別設定（早班/晚班…，PT 依此選班）----
   body.appendChild(frag(`<div class="divider"></div>`));
-  body.appendChild(frag(`<p class="subhead">班別設定（例：早班 9:30–14:00、晚班 13:00–22:00）。正職排完後，PT 會依這裡的班別點選空缺。</p>`));
+  body.appendChild(frag(`<p class="subhead">班別設定（例：早班 9:30–14:00、晚班 13:00–22:00）。「計薪時數」＝算 PT 薪水用的小時數（例：早班 4、晚班 8）。正職排完後 PT 依此點選空缺。</p>`));
   const psList = document.createElement("div"); psList.className = "adm-list";
   const psOpts = timeOptions();
   function psCard(p) {
@@ -1492,17 +1178,19 @@ async function openAdmin() {
     const label = frag(`<input class="inp" placeholder="班別名稱，例：早班">`); label.value = p?.label || "";
     const ss = document.createElement("select"); ss.className = "inp"; ss.innerHTML = psOpts.map((t) => `<option>${t}</option>`).join(""); ss.value = p?.start_time || "09:30";
     const es = document.createElement("select"); es.className = "inp"; es.innerHTML = psOpts.map((t) => `<option>${t}</option>`).join(""); es.value = p?.end_time || "14:00";
-    fields.append(fieldWrap("名稱", label, "fld-grow"), fieldWrap("開始", ss, "fld-cat"), fieldWrap("結束", es, "fld-cat"));
+    const payh = frag(`<input class="inp" type="number" step="0.5" min="0" placeholder="時數">`); if (p?.pay_hours != null) payh.value = p.pay_hours;
+    fields.append(fieldWrap("名稱", label, "fld-grow"), fieldWrap("開始", ss, "fld-cat"), fieldWrap("結束", es, "fld-cat"), fieldWrap("計薪時數", payh, "fld-num"));
     card.appendChild(fields);
     const foot = document.createElement("div"); foot.className = "adm-foot";
     const act = frag(`<button class="btn btn-sm btn-outline">${p ? "更新" : "＋ 新增班別"}</button>`);
     act.onclick = async () => {
       if (!label.value.trim()) { alert("請填班別名稱"); return; }
       if (toMin(es.value) <= toMin(ss.value)) { alert("結束時間需晚於開始時間"); return; }
-      const payload = { label: label.value.trim(), start_time: ss.value, end_time: es.value };
-      let res;
-      if (p) res = await sb.from("preset_shifts").update(payload).eq("id", p.id);
-      else res = await sb.from("preset_shifts").insert({ ...payload, sort_order: (state.presets.reduce((m, x) => Math.max(m, x.sort_order || 0), 0)) + 1 });
+      const payload = { label: label.value.trim(), start_time: ss.value, end_time: es.value, pay_hours: payh.value === "" ? null : Number(payh.value) };
+      const sortAdd = p ? {} : { sort_order: (state.presets.reduce((m, x) => Math.max(m, x.sort_order || 0), 0)) + 1 };
+      const doSave = (pl) => p ? sb.from("preset_shifts").update(pl).eq("id", p.id) : sb.from("preset_shifts").insert({ ...pl, ...sortAdd });
+      let res = await doSave(payload);
+      if (res.error && /pay_hours|column|schema/i.test(res.error.message)) { const { pay_hours, ...rest } = payload; res = await doSave(rest); }
       if (res.error) { alert("儲存失敗：" + res.error.message); return; }
       m.close(); await loadStatic(); loadAndRender(); openAdmin();
     };
