@@ -195,8 +195,7 @@ body {
   text-align: center; margin-bottom: 2px;
 }
 .cal-cell .wline .wn { display: inline-block; font-weight: 700; border-radius: 6px; padding: 0 5px; }
-/* PT：自己有班的那一天 */
-.cal-cell.cal-mine { border-color: var(--amber); background: var(--amber-soft); }
+.day-panel .dp-hours { font-size: 13px; color: var(--text-dim); margin-bottom: 8px; font-weight: 600; }
 .cal-cell .note-tag {
   width: 100%; margin-top: 4px; font-size: 10px; line-height: 1.25;
   color: #f0d9a8; background: rgba(217,164,74,0.20);

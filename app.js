@@ -101,46 +101,18 @@ function workersOf(dateStr) {
     .sort((a, b) => toMin(a.s.start_time) - toMin(b.s.start_time));
 }
 
-// 排班時間（需要有人涵蓋的時段）：優先用 business_hours.staff_open/staff_close，沒設就用營業時間
-function coverWindow(dateStr) {
+// 這天「需要排的班別」：由營業時間頁每天勾選（need_shifts=班別名稱清單）；未設定＝全部班別
+function requiredShifts(dateStr) {
   const bh = bhFor(dateStr);
-  if (!bh || !bh.is_open) return null;
-  return { open: bh.staff_open || bh.open_time, close: bh.staff_close || bh.close_time };
+  if (!bh || !bh.is_open) return [];
+  const presets = state.presets || [];
+  if (bh.need_shifts == null) return presets.slice();
+  const names = String(bh.need_shifts).split(",").map((s) => s.trim()).filter(Boolean);
+  return presets.filter((p) => names.includes(p.label));
 }
-
-// 排班時間是否「沒排滿」（回傳未覆蓋的分鐘數；0 = 有排滿）
-function uncoveredMinutes(dateStr) {
-  const cw = coverWindow(dateStr);
-  if (!cw) return 0;
-  const open = toMin(cw.open), close = toMin(cw.close);
-  const ivs = state.shifts
-    .filter((s) => s.work_date === dateStr && s.status === "work" && s.start_time && s.end_time)
-    .map((s) => [Math.max(toMin(s.start_time), open), Math.min(toMin(s.end_time), close)])
-    .filter(([a, b]) => b > a)
-    .sort((a, b) => a[0] - b[0]);
-  let cursor = open, uncovered = 0;
-  for (const [a, b] of ivs) {
-    if (a > cursor) uncovered += a - cursor;      // 中間有空檔
-    cursor = Math.max(cursor, b);
-  }
-  if (cursor < close) uncovered += close - cursor; // 尾端沒排到打烊
-  return uncovered;
-}
-
-// 當天排班時間內「還沒人排」的空檔（回傳 [[起,迄]...] 分鐘）
-function openGaps(dateStr) {
-  const cw = coverWindow(dateStr);
-  if (!cw) return [];
-  const open = toMin(cw.open), close = toMin(cw.close);
-  const ivs = state.shifts
-    .filter((s) => s.work_date === dateStr && s.status === "work" && s.start_time && s.end_time)
-    .map((s) => [Math.max(toMin(s.start_time), open), Math.min(toMin(s.end_time), close)])
-    .filter(([a, b]) => b > a)
-    .sort((a, b) => a[0] - b[0]);
-  const gaps = []; let cursor = open;
-  for (const [a, b] of ivs) { if (a > cursor) gaps.push([cursor, a]); cursor = Math.max(cursor, b); }
-  if (cursor < close) gaps.push([cursor, close]);
-  return gaps;
+// 這天「還缺人」的必排班別（沒人排定）
+function missingShifts(dateStr) {
+  return requiredShifts(dateStr).filter((p) => !covererOf(dateStr, p.start_time, p.end_time));
 }
 
 // 班別制：同一個班別（起訖完全相同）才算「同一班」。早/晚班交接重疊允許兩人並存。
@@ -168,17 +140,9 @@ function requesterOf(dateStr, start, end) {
   }
   return null;
 }
-// 某天「還可以搶」的班別：排班時間還有空檔、該班別能補到空檔、且沒被別人申請
+// 某天「還可以搶」的必排班別（沒人排定、也沒人申請）
 function openShiftsFor(dateStr) {
-  const cw = coverWindow(dateStr);
-  if (!cw) return [];
-  const gaps = openGaps(dateStr);
-  if (!gaps.length) return [];   // 排班時間已排滿 → 沒有可排的班
-  return (state.presets || []).filter((p) => {
-    if (requesterOf(dateStr, p.start_time, p.end_time)) return false;
-    const ps = toMin(p.start_time), pe = toMin(p.end_time);
-    return gaps.some(([a, b]) => ps < b && a < pe);
-  });
+  return requiredShifts(dateStr).filter((p) => !covererOf(dateStr, p.start_time, p.end_time) && !requesterOf(dateStr, p.start_time, p.end_time));
 }
 
 function bhFor(dateStr) {
@@ -395,12 +359,16 @@ function renderCalendar() {
           return `<div class="wline"><span class="wn" style="background:${col};color:${textOn(col)}">${esc(w.emp.name)}</span> ${compactTime(w.s.start_time)}-${compactTime(w.s.end_time)}</div>`;
         }).join("") + `</div>`;
       }
-      if (!state.user.is_admin && workers.some((w) => w.emp.id === state.user.id)) cls.push("cal-mine"); // 自己有班的那天
+      // 自己有班的那天：日期數字加上自己的顏色圓圈
+      if (!state.user.is_admin) {
+        const mine = workers.find((w) => w.emp.id === state.user.id);
+        if (mine) { const mc = empColor(mine.emp); numStyle = `background:${mc};color:${textOn(mc)}`; }
+      }
       if (state.user.is_admin) {
-        const gap = uncoveredMinutes(date);
-        if (gap > 0) { cls.push("gap"); sub += `<div class="gap-tag">⚠ 未排滿</div>`; }
+        const miss = missingShifts(date);
+        if (miss.length) { cls.push("gap"); sub += `<div class="gap-tag">⚠ 未排滿（${miss.map((p) => esc(p.label)).join("、")}）</div>`; }
       } else {
-        const open = openShiftsFor(date);   // PT：還可搶的班別
+        const open = openShiftsFor(date);   // PT：還缺人的必排班別
         if (open.length) { cls.push("has-open"); sub += open.map((p) => `<div class="open-tag">＋${esc(p.label)}</div>`).join(""); }
       }
     } else {
@@ -559,41 +527,40 @@ function renderDayPanel(dateStr) {
   }
   if (note || isAdmin) panel.appendChild(noteBox);
 
-  // 還沒人排的時段（單人顧店：正職排完，剩下給 PT 選）——只在有設定營業時間的日子顯示
+  // 今日營業時間（全員可見）
   const _bh = bhFor(dateStr);
-  if (_bh && _bh.is_open) {
-    const gaps = openGaps(dateStr);
-    const gapBox = document.createElement("div"); gapBox.className = "dp-gaps";
-    if (gaps.length) gapBox.innerHTML = `🟢 還沒人排的時段：` + gaps.map(([a, b]) => `<b>${minToStr(a)}-${minToStr(b)}</b>`).join("、");
-    else gapBox.innerHTML = `<span class="dp-gaps-full">✓ 營業時間已排滿</span>`;
-    panel.appendChild(gapBox);
+  if (_bh) {
+    panel.appendChild(frag(`<div class="dp-hours">🕐 今日${_bh.is_open ? `營業 ${_bh.open_time}–${_bh.close_time}` : "公休"}</div>`));
   }
 
-  // PT 選班別：可各自認領還空著的班別（早、晚可都上，一個班別一人）
-  if (!isAdmin && !closed && _bh && _bh.is_open && state.presets.length) {
-    const box = document.createElement("div"); box.className = "dp-shifts";
-    box.appendChild(frag(`<div class="dp-shifts-h">可選班別</div>`));
-    state.presets.forEach((p) => {
-      const info = `${esc(p.label)}　${p.start_time}-${p.end_time}`;
-      const coverer = covererOf(dateStr, p.start_time, p.end_time);
-      const requester = coverer ? null : requesterOf(dateStr, p.start_time, p.end_time);
-      const row = document.createElement("div"); row.className = "shift-pick";
-      if (coverer) {
-        const mine = coverer.id === state.user.id;
-        row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-taken">${mine ? "你已排 ✓" : "已排：" + esc(coverer.name)}</span>`;
-      } else if (requester) {
-        const who = requester.emp ? requester.emp.name : "他人";
-        const mine = requester.r.employee_id === state.user.id;
-        row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-pending">${mine ? "你已申請，待核准" : "已被申請：" + esc(who)}</span>`;
-      } else {
-        row.innerHTML = `<span class="sp-info">${info}</span>`;
-        const btn = frag(`<button class="btn btn-primary btn-sm">申請</button>`);
-        btn.onclick = () => pickShift(p, dateStr);
-        row.appendChild(btn);
-      }
-      box.appendChild(row);
-    });
-    panel.appendChild(box);
+  // PT 選班別：只列出「今天需要排的班別」（管理者在營業時間頁勾選），可各自認領
+  if (!isAdmin && !closed && _bh && _bh.is_open) {
+    const reqs = requiredShifts(dateStr);
+    if (reqs.length) {
+      const box = document.createElement("div"); box.className = "dp-shifts";
+      box.appendChild(frag(`<div class="dp-shifts-h">今日班別</div>`));
+      reqs.forEach((p) => {
+        const info = `${esc(p.label)}　${p.start_time}-${p.end_time}`;
+        const coverer = covererOf(dateStr, p.start_time, p.end_time);
+        const requester = coverer ? null : requesterOf(dateStr, p.start_time, p.end_time);
+        const row = document.createElement("div"); row.className = "shift-pick";
+        if (coverer) {
+          const mine = coverer.id === state.user.id;
+          row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-taken">${mine ? "你已排 ✓" : "已排：" + esc(coverer.name)}</span>`;
+        } else if (requester) {
+          const who = requester.emp ? requester.emp.name : "他人";
+          const mine = requester.r.employee_id === state.user.id;
+          row.innerHTML = `<span class="sp-info">${info}</span><span class="sp-pending">${mine ? "你已申請，待核准" : "已被申請：" + esc(who)}</span>`;
+        } else {
+          row.innerHTML = `<span class="sp-info">${info}</span>`;
+          const btn = frag(`<button class="btn btn-primary btn-sm">申請</button>`);
+          btn.onclick = () => pickShift(p, dateStr);
+          row.appendChild(btn);
+        }
+        box.appendChild(row);
+      });
+      panel.appendChild(box);
+    }
   }
 
   // 剪貼簿提示
@@ -743,21 +710,6 @@ function openShiftEditor(empId, dateStr) {
   startSel.value = bh ? bh.open_time : "14:00";
   endSel.value = bh ? bh.close_time : "23:00";
   if (bh && bh.is_open) body.appendChild(frag(`<p class="hint">這天營業 ${bh.open_time}–${bh.close_time}，可排 ${minToStr(toMin(bh.open_time) - 60)}–${minToStr(toMin(bh.close_time) + 60)}</p>`));
-
-  // 還沒人排的時段（一鍵帶入）——單人顧店：直接選剩餘空檔
-  const gaps = openGaps(dateStr).filter(([a, b]) => b - a >= 15);
-  if (gaps.length) {
-    const gapWrap = document.createElement("div");
-    gapWrap.appendChild(frag(`<p class="subhead">還沒人排的時段（點一下帶入）</p>`));
-    const gapRow = document.createElement("div"); gapRow.className = "choice-row";
-    gaps.forEach(([a, b]) => {
-      const gb = document.createElement("button"); gb.className = "choice";
-      gb.innerHTML = `<span class="dot" style="background:var(--st-work)"></span>${minToStr(a)}-${minToStr(b)}`;
-      gb.onclick = () => { startSel.value = minToStr(a); endSel.value = minToStr(b); };
-      gapRow.appendChild(gb);
-    });
-    gapWrap.appendChild(gapRow); body.appendChild(gapWrap);
-  }
 
   // 設為班別選項（管理者）
   let presetChk = null, presetName = null;
@@ -1235,7 +1187,7 @@ async function openAdmin() {
   psList.appendChild(psCard(null));
   shiftPane.appendChild(psList);
 
-  hoursPane.appendChild(frag(`<p class="subhead">營業時間＝店幾點開到幾點（公休日月曆自動標公休）。排班時間＝需要有人顧的時段，月曆「未排滿」以它為準（留空＝同營業時間）。</p>`));
+  hoursPane.appendChild(frag(`<p class="subhead">營業時間＝店幾點開到幾點（公休日月曆自動標公休）。「這天需要的班別」＝勾了哪些班就代表那天要有人上（例：只勾晚班＝這天只需晚班）。月曆「未排滿」與 PT 可申請的班，都依此。</p>`));
   const opts = timeOptions();
   const bhList = document.createElement("div"); bhList.className = "adm-list";
   const ctrls = [];
@@ -1246,33 +1198,38 @@ async function openAdmin() {
     const openL = document.createElement("label"); openL.className = "fld fld-check"; openL.append(open, frag(`<span>營業</span>`));
     const o = document.createElement("select"); o.className = "inp"; o.innerHTML = opts.map((t) => `<option>${t}</option>`).join(""); o.value = bh.open_time;
     const c = document.createElement("select"); c.className = "inp"; c.innerHTML = opts.map((t) => `<option>${t}</option>`).join(""); c.value = bh.close_time;
-    const blank = `<option value="">—</option>`;
-    const so = document.createElement("select"); so.className = "inp"; so.innerHTML = blank + opts.map((t) => `<option>${t}</option>`).join(""); so.value = bh.staff_open || "";
-    const sc = document.createElement("select"); sc.className = "inp"; sc.innerHTML = blank + opts.map((t) => `<option>${t}</option>`).join(""); sc.value = bh.staff_close || "";
-    // 第一排：星期＋是否營業；第二排：營業起訖；第三排：排班起訖（手機好讀）
+    // 這天需要哪些班別（勾選）；未設定＝全部
+    const needSet = bh.need_shifts == null ? null : String(bh.need_shifts).split(",").map((s) => s.trim());
+    const shiftChks = (state.presets || []).map((p) => {
+      const l = document.createElement("label"); l.className = "fld fld-check";
+      const cb = frag(`<input type="checkbox">`); cb.checked = needSet == null ? true : needSet.includes(p.label);
+      l.append(cb, frag(`<span>${esc(p.label)}</span>`));
+      return { label: p.label, cb, l };
+    });
+    // 第一排：星期＋是否營業；第二排：營業起訖；第三排：需要的班別
     const row1 = document.createElement("div"); row1.className = "adm-fields";
     row1.append(frag(`<div class="fld"><span>星期</span><div class="adm-name-lg" style="padding-top:2px">週${DOW[i]}</div></div>`), openL);
     const row2 = document.createElement("div"); row2.className = "adm-fields";
     row2.append(fieldWrap("營業開始", o, "fld-half"), fieldWrap("營業結束", c, "fld-half"));
     const row3 = document.createElement("div"); row3.className = "adm-fields";
-    row3.append(fieldWrap("排班開始", so, "fld-half"), fieldWrap("排班結束", sc, "fld-half"));
+    row3.append(frag(`<div class="fld"><span>這天需要的班別</span></div>`), ...shiftChks.map((s) => s.l));
     card.append(row1, row2, row3); bhList.appendChild(card);
-    ctrls.push({ weekday: i, open, o, c, so, sc });
+    ctrls.push({ weekday: i, open, o, c, shiftChks });
   }
   hoursPane.appendChild(bhList);
   const saveBh = frag(`<button class="btn btn-primary" style="margin-top:12px">儲存營業時間</button>`);
   saveBh.onclick = async () => {
-    const rows = ctrls.map((x) => ({ weekday: x.weekday, is_open: x.open.checked, open_time: x.o.value, close_time: x.c.value, staff_open: x.so.value || null, staff_close: x.sc.value || null }));
+    const rows = ctrls.map((x) => ({ weekday: x.weekday, is_open: x.open.checked, open_time: x.o.value, close_time: x.c.value, need_shifts: x.shiftChks.filter((s) => s.cb.checked).map((s) => s.label).join(",") }));
     let res = await sb.from("business_hours").upsert(rows, { onConflict: "weekday" });
-    let staffDropped = false;
-    if (res.error && /staff_|column|schema/i.test(res.error.message)) {
-      const bare = rows.map(({ staff_open, staff_close, ...r }) => r);
+    let dropped = false;
+    if (res.error && /need_shifts|column|schema/i.test(res.error.message)) {
+      const bare = rows.map(({ need_shifts, ...r }) => r);
       res = await sb.from("business_hours").upsert(bare, { onConflict: "weekday" });
-      staffDropped = !res.error;
+      dropped = !res.error;
     }
     if (res.error) { alert("儲存失敗：" + res.error.message); return; }
     await loadStatic(); loadAndRender();
-    if (staffDropped) alert("營業時間已存，但『排班時間』還沒生效——請先在 Supabase 跑一次 新專案_計薪時數.sql（會建立排班時間欄位），再回來設定即可保存。");
+    if (dropped) alert("營業時間已存，但『每天班別勾選』還沒生效——請先在 Supabase 跑一次 新專案_計薪時數.sql，再回來設定即可保存。");
     else alert("營業時間已儲存");
   };
   hoursPane.appendChild(saveBh);
